@@ -1098,6 +1098,12 @@ impl Name {
             quote: None,
         }
     }
+    pub const fn empty() -> Self {
+        Self {
+            value: String::new(),
+            quote: None,
+        }
+    }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
     pub fn from_bytes(s: &[u8]) -> Self {
         Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
