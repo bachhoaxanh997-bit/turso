@@ -66,7 +66,7 @@ use crate::{
 };
 use crate::{
     get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, QueryMode,
+    MvCursor, NonNan, QueryMode,
 };
 use crate::{CdcVersion, Statement};
 use branches::{mark_unlikely, unlikely};
@@ -496,6 +496,31 @@ pub fn op_checkpoint(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    match op_checkpoint_inner(program, state, insn, _pager) {
+        Ok(result) => {
+            if !matches!(result, InsnFunctionStepResult::IO(_)) {
+                state.op_checkpoint_state = Default::default();
+            }
+            Ok(result)
+        }
+        Err(err) => {
+            state.op_checkpoint_state = Default::default();
+            Err(err)
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct OpCheckpointState {
+    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<MvccClock>>>,
+}
+
+fn op_checkpoint_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
     fn set_not_in_wal_result(state: &mut ProgramState, dest: usize) {
         // Match SQLite for databases that are not in WAL mode.
         state.registers[dest].set_int(0);
@@ -551,31 +576,22 @@ pub fn op_checkpoint(
                 "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
             ));
         }
-        use crate::state_machine::{StateTransition, TransitionResult};
-        let mut ckpt_sm = CheckpointStateMachine::new(
-            pager.clone(),
-            mv_store.clone(),
-            program.connection.clone(),
-            true,
-            program.connection.get_sync_mode(),
-        );
+        if state.op_checkpoint_state.checkpoint_sm.is_none() {
+            state.op_checkpoint_state.checkpoint_sm =
+                Some(StateMachine::new(CheckpointStateMachine::new(
+                    pager.clone(),
+                    mv_store.clone(),
+                    program.connection.clone(),
+                    true,
+                    program.connection.get_sync_mode(),
+                )));
+        }
+        let ckpt_sm = state.op_checkpoint_state.checkpoint_sm.as_mut().unwrap();
         let CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
             ..
-        } = loop {
-            match ckpt_sm.step(&()) {
-                Ok(TransitionResult::Continue) => {}
-                Ok(TransitionResult::Done(result)) => break result,
-                Ok(TransitionResult::Io(iocompletions)) => {
-                    if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
-                        ckpt_sm.cleanup_after_external_io_error();
-                        return Err(err);
-                    }
-                }
-                Err(err) => return Err(err),
-            }
-        };
+        } = return_if_io!(ckpt_sm.step(&()));
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest].set_int(0);
@@ -3735,6 +3751,7 @@ pub fn op_savepoint(
             conn.with_snapshot_non_main_schemas(|temp_schema_snapshot, staged_schema_snapshot| {
                 let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
                 let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
+                let main_schema_snapshot = conn.schema.read().clone();
 
                 if let Some(mv_store) = mv_store.as_ref() {
                     let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -3768,6 +3785,7 @@ pub fn op_savepoint(
                     name: name.clone(),
                     starts_transaction,
                     deferred_fk_violations,
+                    main_schema_snapshot,
                     temp_schema_snapshot,
                     staged_schema_snapshot,
                 };
@@ -3876,6 +3894,7 @@ pub fn op_savepoint(
             // attached pagers; without this restore, the in-memory schemas
             // would keep DDL that the disk-level rollback just undid.
             if let Some(info) = frame_info {
+                *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
                         Some(snap) => *temp_db.db.schema.lock() = snap,
@@ -3895,35 +3914,10 @@ pub fn op_savepoint(
                 }
             });
 
-            // After rolling back pages, the in-memory schema cache may be stale
-            // if DDL was executed within the savepoint. Invalidate the pager's
-            // cached schema cookie and check if a schema reparse is needed.
+            // After rolling back pages, the in-memory main schema has already
+            // been restored from the savepoint snapshot. Invalidate the pager's
+            // cached schema cookie so the next header read refreshes it from disk.
             pager.set_schema_cookie(None);
-            let in_memory_version = conn.schema.read().schema_version;
-            let pager_ref = conn.pager.load().clone();
-            match pager_ref
-                .io
-                .block(|| pager.with_header(|h| h.schema_cookie.get()))
-            {
-                Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
-                    // Schema was modified during the savepoint. Try to reparse
-                    // from the restored database pages. If that fails (e.g. the
-                    // database was empty at the savepoint), use an empty schema.
-                    if conn.reparse_schema().is_err() {
-                        conn.with_schema_mut(|schema| {
-                            *schema = Schema::new();
-                        });
-                    }
-                }
-                Err(_) => {
-                    // Header page is not readable (database empty after rollback).
-                    // Reset to an empty schema.
-                    conn.with_schema_mut(|schema| {
-                        *schema = Schema::new();
-                    });
-                }
-                _ => {} // Schema unchanged, nothing to do.
-            }
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -14360,22 +14354,12 @@ fn op_vacuum_into_inner(
                     "page_size",
                 )?;
 
-                let reserved_space: u8 = if !is_attached_db(database_id) {
-                    // For main or temp db prefer cached value to avoid blocking I/O
-                    match program.connection.get_reserved_bytes() {
-                        Some(val) => val,
-                        None => {
-                            let pager = program.connection.pager.load();
-                            io.block(|| pager.with_header(|header| header.reserved_space))?
-                        }
-                    }
-                } else {
-                    // For attached db read from its own pager
-                    let pager = program
-                        .connection
-                        .get_pager_from_database_index(&database_id);
-                    io.block(|| pager.with_header(|header| header.reserved_space))?
-                };
+                let pager = program
+                    .connection
+                    .get_pager_from_database_index(&database_id);
+                let reserved_space: u8 = pager
+                    .get_reserved_space()
+                    .unwrap_or_else(|| pager.io_ctx.read().get_reserved_space_bytes());
 
                 // Mirror source feature flags to the destination so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
