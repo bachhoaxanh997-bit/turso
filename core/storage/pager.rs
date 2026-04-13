@@ -36,6 +36,7 @@ use crate::{
 };
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
+use rustc_hash::FxHashMap as HashMap;
 use std::cell::UnsafeCell;
 use tracing::{instrument, trace, Level};
 
@@ -1164,9 +1165,18 @@ enum PtrMapPutState {
 #[derive(Debug, Clone)]
 enum HeaderRefState {
     Start,
-    CreateHeader {
+    CreateHeader { page: PageRef },
+}
+
+#[derive(Debug, Clone)]
+enum InflightPageRead {
+    Reading {
         page: PageRef,
-        completion: Option<Completion>,
+        completion: Completion,
+    },
+    CacheInsert {
+        page: PageRef,
+        completion: Completion,
     },
 }
 
@@ -1305,6 +1315,7 @@ pub struct Pager {
     pub(crate) wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
+    inflight_page_reads: RwLock<HashMap<usize, InflightPageRead>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -1371,6 +1382,9 @@ pub struct VacuumState {
 #[derive(Debug, Clone)]
 enum AllocatePageState {
     Start,
+    LoadFreelistTrunk {
+        trunk_page_id: u32,
+    },
     /// Search the trunk page for an available free list leaf.
     /// If none are found, there are two options:
     /// - If there are no more trunk pages, the freelist is empty, so allocate a new page.
@@ -1496,6 +1510,7 @@ impl Pager {
             db_file,
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
+            inflight_page_reads: RwLock::new(HashMap::default()),
             io,
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
@@ -1586,23 +1601,10 @@ impl Pager {
                         return Ok(IOResult::Done(page1));
                     }
 
-                    let (page, c) = self.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
-                        page,
-                        completion: c.clone(),
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
+                    let page = return_if_io!(self.read_page(DatabaseHeader::PAGE_ID as i64));
+                    *self.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                 }
-                HeaderRefState::CreateHeader { page, completion } => {
-                    // Check if the read failed (e.g., due to checksum/decryption error)
-                    if let Some(ref c) = completion {
-                        if let Some(err) = c.get_error() {
-                            *self.header_ref_state.write() = HeaderRefState::Start;
-                            return Err(err.into());
-                        }
-                    }
+                HeaderRefState::CreateHeader { page } => {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     turso_assert!(
                         page.get().id == DatabaseHeader::PAGE_ID,
@@ -2124,14 +2126,11 @@ impl Pager {
                         ptrmap_pg_no
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
+                    let ptrmap_page = return_if_io!(self.read_page(ptrmap_pg_no as i64));
                     self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
                     };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
                 }
                 PtrMapGetState::Deserialize {
                     ptrmap_page,
@@ -2224,14 +2223,11 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
+                    let ptrmap_page = return_if_io!(self.read_page(ptrmap_pg_no as i64));
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
                     };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
                 }
                 PtrMapPutState::Deserialize {
                     ptrmap_page,
@@ -2860,40 +2856,93 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
-    pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: i64) -> Result<IOResult<PageRef>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page(page_idx = {})", page_idx);
+        let page_idx = page_idx as usize;
 
         // First check if page is in cache
         {
             let mut page_cache = self.page_cache.write();
-            let page_key = PageCacheKey::new(page_idx as usize);
+            let page_key = PageCacheKey::new(page_idx);
             if let Some(page) = page_cache.get(&page_key)? {
                 turso_assert!(
-                    page_idx as usize == page.get().id,
+                    page_idx == page.get().id,
                     "attempted to read page but got different page",
                     { "expected_page": page_idx, "actual_page": page.get().id }
                 );
-                return Ok((page, None));
+                return Ok(IOResult::Done(page));
             }
         }
 
-        tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-        // Page not in cache, read from disk
-        let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         loop {
-            match self.cache_insert(page_idx as usize, page.clone())? {
-                IOResult::Done(()) => {
-                    return Ok((page, Some(c)));
+            let inflight_read = self.inflight_page_reads.read().get(&page_idx).cloned();
+            match inflight_read {
+                Some(InflightPageRead::Reading { page, completion }) => {
+                    if !completion.finished() {
+                        return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                    }
+                    if let Some(err) = completion.get_error() {
+                        self.inflight_page_reads.write().remove(&page_idx);
+                        return Err(err.into());
+                    }
+                    match self.cache_insert(page_idx, page.clone())? {
+                        IOResult::Done(()) => {
+                            self.inflight_page_reads.write().remove(&page_idx);
+                            return Ok(IOResult::Done(page));
+                        }
+                        IOResult::IO(IOCompletions::Single(completion)) => {
+                            self.inflight_page_reads.write().insert(
+                                page_idx,
+                                InflightPageRead::CacheInsert {
+                                    page,
+                                    completion: completion.clone(),
+                                },
+                            );
+                            return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                        }
+                    }
                 }
-                IOResult::IO(IOCompletions::Single(spill_c)) => {
-                    // NOTE: Because `cache_insert` can return completions as *multiple* different states, we cannot
-                    // simply create a new CompletionGroup and return it here without inserting the
-                    // page into the cache. In order to do this, we would need to make read_page
-                    // re-entrant so it continues to call cache_insert and have every caller
-                    // propogate the IOResult. For now, we will wait syncronously for spilling IO
-                    // on cache insertion on read_page.
-                    self.io.wait_for_completion(spill_c)?;
+                Some(InflightPageRead::CacheInsert { page, completion }) => {
+                    if !completion.finished() {
+                        return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                    }
+                    if let Some(err) = completion.get_error() {
+                        self.inflight_page_reads.write().remove(&page_idx);
+                        return Err(err.into());
+                    }
+                    match self.cache_insert(page_idx, page.clone())? {
+                        IOResult::Done(()) => {
+                            self.inflight_page_reads.write().remove(&page_idx);
+                            return Ok(IOResult::Done(page));
+                        }
+                        IOResult::IO(IOCompletions::Single(completion)) => {
+                            self.inflight_page_reads.write().insert(
+                                page_idx,
+                                InflightPageRead::CacheInsert {
+                                    page,
+                                    completion: completion.clone(),
+                                },
+                            );
+                            return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                        }
+                    }
+                }
+                None => {
+                    return_if_io!(self.ensure_cache_space());
+                    tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+                    let (page, completion) =
+                        self.read_page_no_cache(page_idx as i64, None, false)?;
+                    self.inflight_page_reads.write().insert(
+                        page_idx,
+                        InflightPageRead::Reading {
+                            page,
+                            completion: completion.clone(),
+                        },
+                    );
+                    if !completion.finished() {
+                        return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                    }
                 }
             }
         }
@@ -4259,6 +4308,7 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        self.clear_inflight_page_reads();
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
@@ -4358,7 +4408,7 @@ impl Pager {
                         )));
                     }
 
-                    let (page, c) = match page.take() {
+                    let page = match page.take() {
                         Some(page) => {
                             turso_assert_eq!(
                                 page.get().id,
@@ -4370,9 +4420,9 @@ impl Pager {
                                 let page_contents = page.get_contents();
                                 page_contents.overflow_cells.clear();
                             }
-                            (page, None)
+                            page
                         }
-                        None => self.read_page(page_id as i64)?,
+                        None => return_if_io!(self.read_page(page_id as i64)),
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
                     self.cache_header_fields(header);
@@ -4387,20 +4437,10 @@ impl Pager {
                     } else {
                         *state = FreePageState::NewTrunk { page };
                     }
-                    if let Some(c) = c {
-                        if !c.succeeded() {
-                            io_yield_one!(c);
-                        }
-                    }
                 }
                 FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
-                    if let Some(c) = c {
-                        if !c.succeeded() {
-                            io_yield_one!(c);
-                        }
-                    }
+                    let trunk_page = return_if_io!(self.read_page(trunk_page_id as i64));
                     turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
 
                     let trunk_page_contents = trunk_page.get_contents();
@@ -4601,13 +4641,15 @@ impl Pager {
                         };
                         continue;
                     }
-                    let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
+                    *state = AllocatePageState::LoadFreelistTrunk {
+                        trunk_page_id: first_freelist_trunk_page_id,
+                    };
+                }
+                AllocatePageState::LoadFreelistTrunk { trunk_page_id } => {
+                    let trunk_page = return_if_io!(self.read_page(*trunk_page_id as i64));
                     // Pin trunk_page to prevent eviction while stored in state machine
                     trunk_page.pin();
                     *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
                     turso_assert!(
@@ -4627,7 +4669,7 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
-                        let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
+                        let leaf_page = return_if_io!(self.read_page(next_leaf_page_id as i64));
 
                         turso_assert!(
                             number_of_freelist_leaves > 0,
@@ -4644,9 +4686,6 @@ impl Pager {
                             leaf_page,
                             number_of_freelist_leaves,
                         };
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
                         continue;
                     }
 
@@ -4845,6 +4884,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
+        self.clear_inflight_page_reads();
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
@@ -4860,6 +4900,17 @@ impl Pager {
         }
 
         *self.header_ref_state.write() = HeaderRefState::Start;
+    }
+
+    fn clear_inflight_page_reads(&self) {
+        let mut inflight_reads = self.inflight_page_reads.write();
+        for inflight_read in inflight_reads.values() {
+            match inflight_read {
+                InflightPageRead::Reading { completion, .. }
+                | InflightPageRead::CacheInsert { completion, .. } => completion.abort(),
+            }
+        }
+        inflight_reads.clear();
     }
 
     fn cache_header_fields(&self, header: &DatabaseHeader) {
