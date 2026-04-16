@@ -771,7 +771,7 @@ fn optimize_update_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let schema = resolver.schema();
-    let is_update_from = plan.table_references.joined_tables().len() > 1;
+    let is_update_from = plan.is_update_from();
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
@@ -783,41 +783,26 @@ fn optimize_update_plan(
     {
         plan.contains_constant_false_condition = true;
         if is_update_from {
-            let join_order = plan
-                .table_references
-                .joined_tables()
-                .iter()
-                .enumerate()
-                .map(|(i, t)| JoinOrderMember {
-                    table_id: t.internal_id,
-                    original_idx: i,
-                    is_outer: t
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|join_info| join_info.is_outer()),
-                })
-                .collect();
-            add_ephemeral_table_to_update_plan(program, plan, join_order)?;
+            let update_from_result_columns = update_from_result_columns(&plan.set_clauses);
+            add_ephemeral_table_to_update_plan(
+                program,
+                plan,
+                default_join_order(&plan.table_references),
+                update_from_result_columns,
+            )?;
         }
         return Ok(());
     }
-    let mut synthetic_result_columns = if is_update_from {
-        plan.set_clauses
-            .iter()
-            .map(|(_, expr)| ResultSetColumn {
-                expr: expr.as_ref().clone(),
-                alias: None,
-                implicit_column_name: None,
-                contains_aggregates: false,
-            })
-            .collect::<Vec<_>>()
+    let mut update_from_result_columns = if is_update_from {
+        update_from_result_columns(&plan.set_clauses)
     } else {
         Vec::new()
     };
-    let result_columns_for_access: &mut [ResultSetColumn] = if synthetic_result_columns.is_empty() {
+    let result_columns_for_access: &mut [ResultSetColumn] = if update_from_result_columns.is_empty()
+    {
         &mut []
     } else {
-        synthetic_result_columns.as_mut_slice()
+        update_from_result_columns.as_mut_slice()
     };
 
     let optimize_result = optimize_table_access(
@@ -845,23 +830,9 @@ fn optimize_update_plan(
 
     let join_order = optimize_result
         .map(|result| result.join_order)
-        .unwrap_or_else(|| {
-            plan.table_references
-                .joined_tables()
-                .iter()
-                .enumerate()
-                .map(|(i, t)| JoinOrderMember {
-                    table_id: t.internal_id,
-                    original_idx: i,
-                    is_outer: t
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|join_info| join_info.is_outer()),
-                })
-                .collect()
-        });
+        .unwrap_or_else(|| default_join_order(&plan.table_references));
 
-    add_ephemeral_table_to_update_plan(program, plan, join_order)
+    add_ephemeral_table_to_update_plan(program, plan, join_order, update_from_result_columns)
 }
 
 fn first_update_safety_reason(
@@ -870,10 +841,6 @@ fn first_update_safety_reason(
 ) -> Result<Option<DmlSafetyReason>> {
     let table_ref = &plan.table_references.joined_tables()[0];
     let reason = 'requires: {
-        if plan.table_references.joined_tables().len() > 1 {
-            break 'requires Some(DmlSafetyReason::UpdateFrom);
-        }
-
         let Some(btree_table_arc) = table_ref.table.btree() else {
             break 'requires None;
         };
@@ -1025,9 +992,10 @@ fn add_ephemeral_table_to_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
     join_order: Vec<JoinOrderMember>,
+    update_from_result_columns: Vec<ResultSetColumn>,
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
-    let is_update_from = plan.table_references.joined_tables().len() > 1;
+    let is_update_from = plan.is_update_from();
     let columns = if is_update_from {
         update_from_ephemeral_columns(plan)
     } else {
@@ -1109,20 +1077,7 @@ fn add_ephemeral_table_to_update_plan(
         .unwrap()
         .internal_id;
 
-    let mut result_columns = if is_update_from {
-        plan.set_clauses
-            .iter()
-            .enumerate()
-            .map(|(idx, (_, expr))| ResultSetColumn {
-                expr: expr.as_ref().clone(),
-                alias: Some(format!("__update_from_{idx}")),
-                implicit_column_name: None,
-                contains_aggregates: false,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    let mut result_columns = update_from_result_columns;
     result_columns.push(ResultSetColumn {
         expr: Expr::RowId {
             database: None,
@@ -1154,11 +1109,10 @@ fn add_ephemeral_table_to_update_plan(
         window: None,
         input_cardinality_hint: None,
         estimated_output_rows: None,
-        // Only move WHERE clause subqueries to the ephemeral plan.
-        // SET clause and RETURNING clause subqueries must remain in the main update plan
-        // because they compute new column values during the update phase (second pass),
-        // not during row collection (first pass). Moving them here would cause correlated
-        // subqueries in SET to evaluate with wrong cursor positions.
+        // For regular UPDATEs, only WHERE-clause subqueries move into the ephemeral plan.
+        // For UPDATE ... FROM, SET expressions are now part of the ephemeral SELECT payload,
+        // so their subqueries move too and are re-phased to SELECT-style BeforeLoop.
+        // RETURNING subqueries always remain in the main update plan.
         non_from_clause_subqueries: {
             let update_phase_ids = if is_update_from {
                 let mut ids = HashSet::default();
@@ -1202,25 +1156,55 @@ fn add_ephemeral_table_to_update_plan(
     plan.ephemeral_plan = Some(ephemeral_plan);
 
     if is_update_from {
-        plan.set_clauses = plan
-            .set_clauses
-            .iter()
-            .enumerate()
-            .map(|(idx, (col_idx, _))| {
-                (
-                    *col_idx,
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: idx,
-                        is_rowid_alias: false,
-                    }),
-                )
-            })
-            .collect();
+        plan.materialized_set_clauses = Some(
+            plan.set_clauses
+                .iter()
+                .enumerate()
+                .map(|(idx, (col_idx, _))| {
+                    (
+                        *col_idx,
+                        Box::new(Expr::Column {
+                            database: None,
+                            table: internal_id,
+                            column: idx,
+                            is_rowid_alias: false,
+                        }),
+                    )
+                })
+                .collect(),
+        );
     }
 
     Ok(())
+}
+
+fn default_join_order(table_references: &TableReferences) -> Vec<JoinOrderMember> {
+    table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: t
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer()),
+        })
+        .collect()
+}
+
+fn update_from_result_columns(set_clauses: &[(usize, Box<ast::Expr>)]) -> Vec<ResultSetColumn> {
+    set_clauses
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, expr))| ResultSetColumn {
+            expr: expr.as_ref().clone(),
+            alias: Some(format!("__update_from_{idx}")),
+            implicit_column_name: None,
+            contains_aggregates: false,
+        })
+        .collect()
 }
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {

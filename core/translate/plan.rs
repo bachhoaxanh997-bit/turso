@@ -770,6 +770,9 @@ pub struct UpdatePlan {
     pub or_conflict: Option<ResolveType>,
     // (column index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
+    /// Alternate SET expressions for the actual update loop after payload values have
+    /// been materialized into an ephemeral table (used by UPDATE ... FROM).
+    pub materialized_set_clauses: Option<Vec<(usize, Box<ast::Expr>)>>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     pub limit: Option<Box<Expr>>,
@@ -791,6 +794,12 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+}
+
+impl UpdatePlan {
+    pub fn is_update_from(&self) -> bool {
+        self.table_references.joined_tables().len() > 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

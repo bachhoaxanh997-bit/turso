@@ -561,6 +561,7 @@ pub fn prepare_update_plan(
         table_references,
         or_conflict,
         set_clauses,
+        materialized_set_clauses: None,
         where_clause,
         returning: if result_columns.is_empty() {
             None

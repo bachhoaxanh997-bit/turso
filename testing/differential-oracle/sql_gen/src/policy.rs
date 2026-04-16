@@ -1440,7 +1440,6 @@ pub struct UpdateConfig {
     /// Probability of generating a CTE (WITH clause) for UPDATE.
     pub cte_probability: f64,
 
-    // Stubs (not yet implemented, probability 0.0)
     /// Probability of UPDATE ... FROM.
     pub from_probability: f64,
 
@@ -1460,8 +1459,7 @@ impl Default for UpdateConfig {
             expression_value_probability: 0.4,
             expression_value_max_depth: 2,
             cte_probability: 0.1,
-            // Stubs
-            from_probability: 0.0,
+            from_probability: 0.15,
             returning_probability: 0.0,
         }
     }

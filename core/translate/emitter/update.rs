@@ -373,10 +373,14 @@ pub fn emit_program_for_update(
     };
 
     // Emit update instructions
+    let effective_set_clauses = plan
+        .materialized_set_clauses
+        .as_deref()
+        .unwrap_or(&plan.set_clauses);
     emit_update_insns(
         connection,
         &mut plan.table_references,
-        &plan.set_clauses,
+        effective_set_clauses,
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
@@ -847,11 +851,15 @@ fn emit_update_insns<'a>(
         .expect("loop labels to exist");
     // Label to skip to the next row on conflict (for IGNORE mode)
     let skip_row_label = loop_labels.next;
-    let source_table = table_references
-        .joined_tables()
-        .first()
-        .expect("UPDATE must have a source table");
-    let (index, is_virtual_table) = match &source_table.op {
+    let access_table = if ephemeral_plan.is_some() {
+        target_table.as_ref()
+    } else {
+        table_references
+            .joined_tables()
+            .first()
+            .expect("UPDATE must have a source table")
+    };
+    let (index, is_virtual_table) = match &access_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
