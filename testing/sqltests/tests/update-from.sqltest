@@ -469,19 +469,6 @@ expect {
     3|1|root->child-b
 }
 
-test update-from-limit-errors {
-    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
-    CREATE TABLE src (id INTEGER, bump INTEGER);
-    INSERT INTO target VALUES (1, 10), (2, 20);
-    INSERT INTO src VALUES (1, 1), (2, 2);
-    UPDATE target
-       SET val = val + src.bump
-      FROM src
-     LIMIT 1;
-}
-expect error {
-}
-
 # Updating a column that is also an indexed column — indexes must be maintained.
 @cross-check-integrity
 test update-from-updates-indexed-column {

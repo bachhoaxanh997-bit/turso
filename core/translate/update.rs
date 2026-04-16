@@ -212,9 +212,6 @@ fn validate_update(
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
-    if body.from.is_some() && body.limit.is_some() {
-        bail_parse_error!("LIMIT is not supported in UPDATE FROM");
-    }
     // Check if this is a materialized view
     if schema.is_materialized_view(table_name) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
