@@ -26,7 +26,7 @@ use super::plan::{
 use super::planner::{parse_from, parse_where};
 use super::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
+    plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -81,15 +81,6 @@ pub fn translate_update(
                 connection,
             )?;
         }
-        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
-        plan_subqueries_from_set_clauses(
-            program,
-            &mut update_plan.non_from_clause_subqueries,
-            &mut update_plan.table_references,
-            &mut update_plan.set_clauses,
-            resolver,
-            connection,
-        )?;
     }
 
     optimize_plan(program, &mut plan, resolver)?;
@@ -111,6 +102,59 @@ pub fn translate_update(
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(())
+}
+
+/// Normalize a planned UPDATE RHS into the per-column expressions consumed by SET.
+///
+/// SQLite keeps row-value RHS expressions intact until subquery planning has
+/// expanded their true width. UPDATE does the same here: once the RHS has been
+/// planned, multi-column subqueries become a single `SubqueryResult { RowValue }`
+/// and can be projected into scalar field reads without cloning the subquery.
+fn split_update_set_values(expr: &Expr, target_count: usize) -> crate::Result<Vec<Box<Expr>>> {
+    match expr {
+        Expr::Parenthesized(vals) => {
+            if vals.len() != target_count {
+                bail_parse_error!("{} columns assigned {} values", target_count, vals.len());
+            }
+            Ok(vals.clone())
+        }
+        Expr::SubqueryResult {
+            subquery_id,
+            lhs,
+            not_in,
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                },
+        } => {
+            if *num_regs != target_count {
+                bail_parse_error!("{} columns assigned {} values", target_count, num_regs);
+            }
+            Ok((0..*num_regs)
+                .map(|offset| {
+                    Box::new(Expr::SubqueryResult {
+                        subquery_id: *subquery_id,
+                        lhs: lhs.clone(),
+                        not_in: *not_in,
+                        query_type: ast::SubqueryType::RowValue {
+                            result_reg_start: result_reg_start + offset,
+                            num_regs: 1,
+                        },
+                    })
+                })
+                .collect())
+        }
+        Expr::Subquery(_) => Err(crate::LimboError::InternalError(
+            "UPDATE set clause subquery should be planned before normalization".to_string(),
+        )),
+        expr => {
+            if target_count != 1 {
+                bail_parse_error!("{} columns assigned 1 values", target_count);
+            }
+            Ok(vec![expr.clone().into()])
+        }
+    }
 }
 
 pub fn translate_update_for_schema_change(
@@ -141,15 +185,6 @@ pub fn translate_update_for_schema_change(
                 connection,
             )?;
         }
-        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
-        plan_subqueries_from_set_clauses(
-            program,
-            &mut update_plan.non_from_clause_subqueries,
-            &mut update_plan.table_references,
-            &mut update_plan.set_clauses,
-            resolver,
-            connection,
-        )?;
     }
 
     optimize_plan(program, &mut plan, resolver)?;
@@ -269,7 +304,6 @@ pub fn prepare_update_plan(
         indexed,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
-    let has_update_from = body.from.is_some();
     let mut where_clause = vec![];
     let mut vtab_predicates = vec![];
     parse_from(
@@ -315,10 +349,8 @@ pub fn prepare_update_plan(
         .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
         .collect();
 
-    let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
+    let mut non_from_clause_subqueries = vec![];
 
-    // Process each SET assignment and map column names to expressions
-    // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
     for set in &mut body.sets {
         bind_and_rewrite_expr(
             &mut set.expr,
@@ -327,19 +359,23 @@ pub fn prepare_update_plan(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
+    }
 
-        let values = match set.expr.as_ref() {
-            Expr::Parenthesized(vals) => vals.clone(),
-            expr => vec![expr.clone().into()],
-        };
+    plan_subqueries_from_update_sets(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut table_references,
+        &mut body.sets,
+        resolver,
+        connection,
+    )?;
 
-        if set.col_names.len() != values.len() {
-            bail_parse_error!(
-                "{} columns assigned {} values",
-                set.col_names.len(),
-                values.len()
-            );
-        }
+    let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
+
+    // Process each SET assignment and map column names to expressions
+    // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
+    for set in &mut body.sets {
+        let values = split_update_set_values(set.expr.as_ref(), set.col_names.len())?;
 
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
             let ident = normalize_ident(col_name.as_str());
@@ -421,15 +457,16 @@ pub fn prepare_update_plan(
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
-    let mut non_from_clause_subqueries = vec![];
-    let mut returning_table_references = if has_update_from {
-        TableReferences::new(
-            vec![table_references.joined_tables()[0].clone()],
-            table_references.outer_query_refs().to_vec(),
-        )
-    } else {
-        table_references.clone()
-    };
+    let mut returning_target = table_references.joined_tables()[0].clone();
+    // SQLite resolves RETURNING columns for an aliased UPDATE target through the
+    // base table name, not the UPDATE alias. Keep the target table in scope, but
+    // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
+    // still fails.
+    returning_target.identifier = table_name.to_string();
+    let mut returning_table_references = TableReferences::new(
+        vec![returning_target],
+        table_references.outer_query_refs().to_vec(),
+    );
     plan_subqueries_from_returning(
         program,
         &mut non_from_clause_subqueries,

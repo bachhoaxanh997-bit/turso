@@ -317,11 +317,17 @@ pub fn plan_subqueries_from_values(
 /// Compute query plans for subqueries in UPDATE SET clause expressions.
 /// This is used by UPDATE statements where SET clause values contain scalar subqueries.
 /// e.g. `UPDATE t SET col = (SELECT max(id) FROM t2)`
-pub fn plan_subqueries_from_set_clauses(
+/// Plan subqueries in raw UPDATE `SET` assignments before the RHS has been
+/// flattened into one scalar expression per target column.
+///
+/// This keeps row-value RHS subqueries as a single planned subquery so UPDATE
+/// normalization can later project fields out of the shared result, matching
+/// SQLite's vector-assignment model.
+pub fn plan_subqueries_from_update_sets(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     table_references: &mut TableReferences,
-    set_clauses: &mut [(usize, Box<ast::Expr>)],
+    sets: &mut [ast::Set],
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -330,9 +336,9 @@ pub fn plan_subqueries_from_set_clauses(
         non_from_clause_subqueries,
         table_references,
         resolver,
-        set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
+        sets.iter_mut().map(|set| set.expr.as_mut()),
         connection,
-        SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+        SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
