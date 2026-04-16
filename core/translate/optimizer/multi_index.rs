@@ -758,7 +758,7 @@ fn analyze_and_terms_for_multi_index(
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
     let table_name = table_reference.table.get_name();
-    let indexes = available_indexes.get(&Identifier::from(table_name));
+    let indexes = available_indexes.get(table_name);
     let rowid_alias_column = table_reference
         .columns()
         .iter()
@@ -845,7 +845,7 @@ fn analyze_and_terms_for_multi_index(
     // Keep only branches that use distinct named indexes. Rowid (`None`) may
     // still appear more than once because it is not tied to a named index.
     let mut unique_branches: Vec<AndBranch> = Vec::new();
-    let mut seen_indexes: Vec<Option<String>> = Vec::new();
+    let mut seen_indexes: Vec<Option<Identifier>> = Vec::new();
     for branch in candidate_branches {
         let index_name = branch.index.as_ref().map(|idx| idx.name.clone());
         if index_name.is_some() && seen_indexes.contains(&index_name) {
@@ -1169,7 +1169,7 @@ mod tests {
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         Arc::new(BTreeTable {
             root_page: 1,
-            name: name.to_string(),
+            name: Identifier::from(name),
             has_autoincrement: false,
             primary_key_columns: vec![],
             columns,
@@ -1286,8 +1286,8 @@ mod tests {
         available_indexes.insert(
             Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_id".to_string(),
-                table_name: "item".to_string(),
+                name: Identifier::from("idx_item_id"),
+                table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![IndexColumn {
                     name: "id".to_string(),
@@ -1435,8 +1435,8 @@ mod tests {
         available_indexes.insert(
             Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_a".to_string(),
-                table_name: "item".to_string(),
+                name: Identifier::from("idx_item_a"),
+                table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![IndexColumn {
                     name: "a".to_string(),
@@ -1548,8 +1548,8 @@ mod tests {
         available_indexes.insert(
             Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_id_kind".to_string(),
-                table_name: "item".to_string(),
+                name: Identifier::from("idx_item_id_kind"),
+                table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![
                     IndexColumn {
@@ -1744,8 +1744,8 @@ mod tests {
         available_indexes.insert(
             Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
-                name: "idx_item_id".to_string(),
-                table_name: "item".to_string(),
+                name: Identifier::from("idx_item_id"),
+                table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![IndexColumn {
                     name: "id".to_string(),
