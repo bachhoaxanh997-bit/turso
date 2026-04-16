@@ -7,8 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{
-    columns_affected_by_update, dependencies_of_columns, BTreeTable, ColumnLayout, IndexColumn,
-    ROWID_SENTINEL,
+    dependencies_of_columns, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
 };
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -187,7 +186,7 @@ fn collect_changed_cols(
 fn upsert_index_is_affected(
     table: &Table,
     idx: &Index,
-    changed_cols: &ColumnMask,
+    directly_changed_cols: &ColumnMask,
     rowid_changed: bool,
 ) -> bool {
     if rowid_changed {
@@ -195,7 +194,7 @@ fn upsert_index_is_affected(
     }
 
     for c in referenced_index_cols(idx, table) {
-        if changed_cols.get(c) {
+        if directly_changed_cols.get(c) {
             return true;
         }
     }
@@ -663,14 +662,7 @@ pub fn emit_upsert(
         )?;
     }
 
-    let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
-    // Expand to include virtual columns that transitively depend on SET columns,
-    // so that indexes on virtual columns are correctly updated.
-    let changed_cols = if ctx.table.has_virtual_columns() {
-        columns_affected_by_update(table.columns(), &changed_cols)
-    } else {
-        changed_cols
-    };
+    let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
@@ -800,7 +792,7 @@ pub fn emit_upsert(
                     ctx.cursor_id,
                     new_start,
                     rowid_new_reg,
-                    &changed_cols,
+                    &directly_changed_cols,
                     upsert_database_id,
                     resolver,
                     &layout,
@@ -813,7 +805,7 @@ pub fn emit_upsert(
                 program,
                 &bt,
                 upsert_indices.iter().filter(|idx| {
-                    upsert_index_is_affected(table, idx, &changed_cols, rowid_changed)
+                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
                 }),
                 ctx.cursor_id,
                 ctx.conflict_rowid_reg,
@@ -855,7 +847,7 @@ pub fn emit_upsert(
                 })
                 .expect("index exists");
 
-            if !upsert_index_is_affected(table, &idx_meta, &changed_cols, rowid_changed) {
+            if !upsert_index_is_affected(table, &idx_meta, &directly_changed_cols, rowid_changed) {
                 continue; // skip untouched index completely
             }
             let k = idx_meta.columns.len();
