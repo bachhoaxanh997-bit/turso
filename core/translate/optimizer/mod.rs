@@ -825,6 +825,10 @@ fn optimize_update_plan(
     }
 
     if !plan.safety.requires_stable_write_set() {
+        debug_assert!(
+            !is_update_from,
+            "UPDATE ... FROM must always materialize a stable write set"
+        );
         return Ok(());
     }
 
@@ -832,7 +836,12 @@ fn optimize_update_plan(
         .map(|result| result.join_order)
         .unwrap_or_else(|| default_join_order(&plan.table_references));
 
-    add_ephemeral_table_to_update_plan(program, plan, join_order, update_from_result_columns)
+    add_ephemeral_table_to_update_plan(program, plan, join_order, update_from_result_columns)?;
+    debug_assert!(
+        !is_update_from || plan.ephemeral_plan.is_some(),
+        "UPDATE ... FROM must produce an ephemeral update plan"
+    );
+    Ok(())
 }
 
 fn first_update_safety_reason(

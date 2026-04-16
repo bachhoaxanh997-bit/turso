@@ -25,8 +25,8 @@ use super::plan::{
 };
 use super::planner::{parse_from, parse_where};
 use super::subquery::{
-    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
+    plan_subqueries_from_returning, plan_subqueries_from_update_sets,
+    plan_subqueries_from_where_clause,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -65,22 +65,19 @@ pub fn translate_update(
 ) -> crate::Result<()> {
     let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
 
-    // Plan subqueries in the WHERE clause and SET clause
     if let Plan::Update(ref mut update_plan) = plan {
-        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
-        } else {
-            // Normal path: subqueries are in the UPDATE plan's WHERE
-            plan_subqueries_from_where_clause(
-                program,
-                &mut update_plan.non_from_clause_subqueries,
-                &mut update_plan.table_references,
-                &mut update_plan.where_clause,
-                resolver,
-                connection,
-            )?;
-        }
+        debug_assert!(
+            update_plan.ephemeral_plan.is_none(),
+            "UPDATE ephemeral plans are introduced during optimization"
+        );
+        plan_subqueries_from_where_clause(
+            program,
+            &mut update_plan.non_from_clause_subqueries,
+            &mut update_plan.table_references,
+            &mut update_plan.where_clause,
+            resolver,
+            connection,
+        )?;
     }
 
     optimize_plan(program, &mut plan, resolver)?;
@@ -172,19 +169,18 @@ pub fn translate_update_for_schema_change(
             update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
         }
 
-        // Plan subqueries in the WHERE clause
-        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
-        } else {
-            plan_subqueries_from_where_clause(
-                program,
-                &mut update_plan.non_from_clause_subqueries,
-                &mut update_plan.table_references,
-                &mut update_plan.where_clause,
-                resolver,
-                connection,
-            )?;
-        }
+        debug_assert!(
+            update_plan.ephemeral_plan.is_none(),
+            "UPDATE ephemeral plans are introduced during optimization"
+        );
+        plan_subqueries_from_where_clause(
+            program,
+            &mut update_plan.non_from_clause_subqueries,
+            &mut update_plan.table_references,
+            &mut update_plan.where_clause,
+            resolver,
+            connection,
+        )?;
     }
 
     optimize_plan(program, &mut plan, resolver)?;
@@ -304,6 +300,7 @@ pub fn prepare_update_plan(
         indexed,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
+    let has_from_clause = body.from.is_some();
     let mut where_clause = vec![];
     let mut vtab_predicates = vec![];
     parse_from(
@@ -329,7 +326,8 @@ pub fn prepare_update_plan(
         .skip(1)
         .any(|joined| {
             joined.identifier == target_identifier
-                || (normalize_ident(joined.table.get_name()) == target_table_name
+                || (body.tbl_name.alias.is_none()
+                    && normalize_ident(joined.table.get_name()) == target_table_name
                     && joined.identifier == target_table_name)
         })
     {
@@ -596,6 +594,7 @@ pub fn prepare_update_plan(
 
     Ok(Plan::Update(UpdatePlan {
         table_references,
+        has_from_clause,
         or_conflict,
         set_clauses,
         materialized_set_clauses: None,

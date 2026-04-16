@@ -766,6 +766,8 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
     pub table_references: TableReferences,
+    /// Whether the parsed UPDATE statement had an explicit FROM clause.
+    pub has_from_clause: bool,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
     // (column index, new value) pairs
@@ -798,7 +800,7 @@ pub struct UpdatePlan {
 
 impl UpdatePlan {
     pub fn is_update_from(&self) -> bool {
-        self.table_references.joined_tables().len() > 1
+        self.has_from_clause
     }
 }
 

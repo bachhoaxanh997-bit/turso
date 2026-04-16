@@ -34,8 +34,8 @@ use crate::{
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
-            QueryDestination, ResultSetColumn, Scan, Search, SelectPlan, SubqueryEvalPhase,
-            TableReferences, UpdatePlan,
+            QueryDestination, ResultSetColumn, Scan, Search, SubqueryEvalPhase, TableReferences,
+            UpdatePlan,
         },
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
@@ -377,6 +377,18 @@ pub fn emit_program_for_update(
         .materialized_set_clauses
         .as_deref()
         .unwrap_or(&plan.set_clauses);
+    debug_assert!(
+        plan.materialized_set_clauses
+            .as_ref()
+            .is_none_or(|materialized| {
+                materialized.len() == plan.set_clauses.len()
+                    && materialized
+                        .iter()
+                        .zip(plan.set_clauses.iter())
+                        .all(|((materialized_idx, _), (set_idx, _))| materialized_idx == set_idx)
+            }),
+        "materialized UPDATE set clauses must stay aligned with original set clauses"
+    );
     emit_update_insns(
         connection,
         &mut plan.table_references,
@@ -384,7 +396,7 @@ pub fn emit_program_for_update(
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
-        plan.ephemeral_plan.as_ref(),
+        has_ephemeral_table,
         &mut t_ctx,
         program,
         &index_cursors,
@@ -830,7 +842,7 @@ fn emit_update_insns<'a>(
     cdc_update_alter_statement: Option<&str>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
-    ephemeral_plan: Option<&SelectPlan>,
+    has_ephemeral_table: bool,
     t_ctx: &mut TranslateCtx<'a>,
     program: &mut ProgramBuilder,
     index_cursors: &[(usize, usize)],
@@ -851,7 +863,7 @@ fn emit_update_insns<'a>(
         .expect("loop labels to exist");
     // Label to skip to the next row on conflict (for IGNORE mode)
     let skip_row_label = loop_labels.next;
-    let access_table = if ephemeral_plan.is_some() {
+    let access_table = if has_ephemeral_table {
         target_table.as_ref()
     } else {
         table_references
@@ -2466,7 +2478,7 @@ fn emit_update_insns<'a>(
                     emit_cdc_insns(
                         program,
                         &t_ctx.resolver,
-                        OperationMode::UPDATE(if ephemeral_plan.is_some() {
+                        OperationMode::UPDATE(if has_ephemeral_table {
                             UpdateRowSource::PrebuiltEphemeralTable {
                                 ephemeral_table_cursor_id: iteration_cursor_id,
                                 target_table: target_table.clone(),

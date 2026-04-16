@@ -394,6 +394,23 @@ expect {
     2|200
 }
 
+# Once the target is aliased, an unaliased FROM-side self-reference is legal.
+@cross-check-integrity
+test update-from-target-alias-allows-unaliased-self-reference {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER, label TEXT);
+    INSERT INTO t VALUES (1, NULL, 'root'), (2, 1, 'child-a'), (3, 1, 'child-b');
+    UPDATE t AS child
+       SET label = t.label || '->' || child.label
+      FROM t
+     WHERE child.parent = t.id;
+    SELECT id, parent, label FROM t ORDER BY id;
+}
+expect {
+    1||root
+    2|1|root->child-a
+    3|1|root->child-b
+}
+
 # Updating a column that is also an indexed column — indexes must be maintained.
 @cross-check-integrity
 test update-from-updates-indexed-column {
