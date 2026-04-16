@@ -14,7 +14,7 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -269,16 +269,6 @@ pub fn prepare_update_plan(
     let indexed = body.indexed.take();
 
     let table_name = table.get_name();
-    let iter_dir = body
-        .order_by
-        .first()
-        .and_then(|ob| {
-            ob.order.map(|o| match o {
-                SortOrder::Asc => IterationDirection::Forwards,
-                SortOrder::Desc => IterationDirection::Backwards,
-            })
-        })
-        .unwrap_or(IterationDirection::Forwards);
 
     let joined_tables = vec![JoinedTable {
         table: match table.as_ref() {
@@ -291,7 +281,7 @@ pub fn prepare_update_plan(
             |alias| alias.as_str().to_string(),
         ),
         internal_id: program.table_reference_counter.next(),
-        op: build_scan_op(&table, iter_dir),
+        op: build_scan_op(&table),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
@@ -325,7 +315,7 @@ pub fn prepare_update_plan(
             .joined_tables()
             .iter()
             .skip(1)
-            .any(|joined| joined.identifier == target_identifier)
+            .any(|joined| normalize_ident(joined.identifier.as_str()) == target_identifier)
     } else {
         table_references
             .joined_tables()
@@ -333,7 +323,7 @@ pub fn prepare_update_plan(
             .skip(1)
             .any(|joined| {
                 normalize_ident(joined.table.get_name()) == target_table_name
-                    && joined.identifier == target_table_name
+                    && normalize_ident(joined.identifier.as_str()) == target_table_name
             })
     };
     if illegal_target_reference {
@@ -486,20 +476,7 @@ pub fn prepare_update_plan(
         resolver,
     )?;
 
-    let order_by = body
-        .order_by
-        .iter_mut()
-        .map(|o| {
-            let _ = bind_and_rewrite_expr(
-                &mut o.expr,
-                Some(&mut table_references),
-                Some(&result_columns),
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            );
-            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc), o.nulls)
-        })
-        .collect();
+    let order_by = vec![];
 
     // Sqlite determines we should create an ephemeral table if we do not have a FROM clause
     // Difficult to say what items from the plan can be checked for this so currently just checking if a RowId Alias is referenced
@@ -622,10 +599,10 @@ pub fn prepare_update_plan(
     }))
 }
 
-fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
+fn build_scan_op(table: &Table) -> Operation {
     match table {
         Table::BTree(_) => Operation::Scan(Scan::BTreeTable {
-            iter_dir,
+            iter_dir: IterationDirection::Forwards,
             index: None,
         }),
         Table::Virtual(_) => Operation::default_scan_for(table),

@@ -293,6 +293,17 @@ test update-from-self-reference-unaliased-errors {
 expect error {
 }
 
+test update-from-self-reference-unaliased-case-insensitive-errors {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    UPDATE t
+       SET v = 1
+      FROM T
+     WHERE t.id = T.id;
+}
+expect error {
+}
+
 # Three-table FROM list (comma-join).
 @cross-check-integrity
 test update-from-three-tables {
@@ -396,6 +407,46 @@ test update-from-row-value-set {
 expect {
     1|new|10
     2|newer|20
+}
+
+@cross-check-integrity
+test update-from-row-value-set-subquery {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, lookup_id INTEGER);
+    CREATE TABLE payload (lookup_id INTEGER PRIMARY KEY, x TEXT, y INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1), (2, 'older', 2);
+    INSERT INTO src VALUES (1, 100), (2, 200);
+    INSERT INTO payload VALUES (100, 'new', 10), (200, 'newer', 20);
+    UPDATE target
+       SET (a, b) = (
+            SELECT payload.x, payload.y
+              FROM payload
+             WHERE payload.lookup_id = src.lookup_id
+       )
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, a, b FROM target ORDER BY id;
+}
+expect {
+    1|new|10
+    2|newer|20
+}
+
+@cross-check-integrity
+test update-from-set-subquery-may-reference-source-table {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 7), (2, 8);
+    UPDATE target
+       SET val = (SELECT target.val + src.bump * 10)
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|80
+    2|100
 }
 
 # RETURNING subqueries may still reference statement-scoped CTEs.
@@ -657,6 +708,29 @@ expect {
     after|2:y
 }
 
+@cross-check-integrity
+test update-from-before-trigger-raise-ignore-skips-row {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO src VALUES (1, 1), (2, 2), (3, 3);
+    CREATE TRIGGER bu BEFORE UPDATE ON target
+    WHEN NEW.id = 2
+    BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|11
+    2|20
+    3|33
+}
+
 # LEFT JOIN sources in the FROM clause should preserve unmatched rows from the
 # joined source graph and still drive the target update once per matched target.
 @cross-check-integrity
@@ -817,4 +891,106 @@ test update-from-or-replace-deletes-conflicting-row {
 expect {
     1|b|111
     3|c|30
+}
+
+test update-from-source-null-violates-not-null {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_v TEXT);
+    INSERT INTO target VALUES (1, 'x');
+    INSERT INTO src VALUES (1, NULL);
+    UPDATE target
+       SET v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+}
+expect error {
+}
+
+test update-from-source-value-violates-check {
+    CREATE TABLE target(
+        id INTEGER PRIMARY KEY,
+        score INTEGER CHECK(score BETWEEN 0 AND 10)
+    );
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_score INTEGER);
+    INSERT INTO target VALUES (1, 5);
+    INSERT INTO src VALUES (1, 99);
+    UPDATE target
+       SET score = src.new_score
+      FROM src
+     WHERE target.id = src.id;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-from-strict-table-coerces-compatible-values {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_v TEXT);
+    INSERT INTO target VALUES (1, 1);
+    INSERT INTO src VALUES (1, '7');
+    UPDATE target
+       SET v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, typeof(v), v FROM target;
+}
+expect {
+    1|integer|7
+}
+
+test update-from-strict-table-rejects-incompatible-values {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_v TEXT);
+    INSERT INTO target VALUES (1, 1);
+    INSERT INTO src VALUES (1, 'abc');
+    UPDATE target
+       SET v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-from-updates-generated-columns {
+    CREATE TABLE target(
+        id INTEGER PRIMARY KEY,
+        base INTEGER,
+        doubled INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL
+    );
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_base INTEGER);
+    INSERT INTO target(id, base) VALUES (1, 3), (2, 4);
+    INSERT INTO src VALUES (1, 7), (2, 9);
+    UPDATE target
+       SET base = src.new_base
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, base, doubled FROM target ORDER BY id;
+}
+expect {
+    1|7|14
+    2|9|18
+}
+
+@cross-check-integrity
+test update-from-or-replace-cascades-foreign-key-deletes {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE target(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        target_u TEXT REFERENCES target(u) ON DELETE CASCADE
+    );
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_u TEXT);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20);
+    INSERT INTO child VALUES (10, 'b');
+    INSERT INTO src VALUES (1, 'b');
+    UPDATE OR REPLACE target
+       SET u = src.new_u
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, u, v FROM target ORDER BY id;
+    SELECT id, target_u FROM child ORDER BY id;
+}
+expect {
+    1|b|10
 }

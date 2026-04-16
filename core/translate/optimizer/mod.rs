@@ -798,16 +798,9 @@ fn optimize_update_plan(
     } else {
         Vec::new()
     };
-    let result_columns_for_access: &mut [ResultSetColumn] = if update_from_result_columns.is_empty()
-    {
-        &mut []
-    } else {
-        update_from_result_columns.as_mut_slice()
-    };
-
     let optimize_result = optimize_table_access(
         schema,
-        result_columns_for_access,
+        update_from_result_columns.as_mut_slice(),
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
@@ -825,7 +818,7 @@ fn optimize_update_plan(
     }
 
     if !plan.safety.requires_stable_write_set() {
-        debug_assert!(
+        turso_assert!(
             !is_update_from,
             "UPDATE ... FROM must always materialize a stable write set"
         );
@@ -1144,7 +1137,7 @@ fn add_ephemeral_table_to_update_plan(
         // so their subqueries move too and are re-phased to SELECT-style BeforeLoop.
         // RETURNING subqueries always remain in the main update plan.
         non_from_clause_subqueries: {
-            let update_phase_ids = if is_update_from {
+            let ids_to_keep_in_main_plan = if is_update_from {
                 collect_subquery_result_ids_from_returning(plan.returning.as_deref())?
             } else {
                 collect_update_phase_subquery_ids(plan)?
@@ -1152,7 +1145,7 @@ fn add_ephemeral_table_to_update_plan(
             let mut ephemeral_subs = Vec::new();
             let mut remaining = Vec::new();
             for sq in plan.non_from_clause_subqueries.drain(..) {
-                if update_phase_ids.contains(&sq.internal_id) {
+                if ids_to_keep_in_main_plan.contains(&sq.internal_id) {
                     remaining.push(sq);
                 } else {
                     let mut sq = sq;

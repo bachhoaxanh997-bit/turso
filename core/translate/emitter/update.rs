@@ -911,6 +911,10 @@ fn emit_update_insns<'a>(
             unreachable!("access through MultiIndexScan is not supported for update operations")
         }
     };
+    turso_assert!(
+        !has_ephemeral_table || index.is_none(),
+        "ephemeral scratch table must not have an index in its scan operation"
+    );
 
     let beg = program.alloc_registers(
         target_table.table.columns().len()
