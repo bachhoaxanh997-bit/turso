@@ -491,3 +491,167 @@ expect {
     1|10
     2|20
 }
+
+# BEFORE/AFTER triggers on the target should see the same row transitions as a
+# plain UPDATE, even when values come from a FROM-side source.
+@cross-check-integrity
+test update-from-triggers-see-updated-values {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_val TEXT);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, kind TEXT, payload TEXT);
+    INSERT INTO target VALUES (1, 'a'), (2, 'b');
+    INSERT INTO src VALUES (1, 'x'), (2, 'y');
+    CREATE TRIGGER bu BEFORE UPDATE ON target BEGIN
+        INSERT INTO log(kind, payload)
+        VALUES('before', OLD.id || ':' || OLD.val || '->' || NEW.val);
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON target BEGIN
+        INSERT INTO log(kind, payload)
+        VALUES('after', NEW.id || ':' || NEW.val);
+    END;
+    UPDATE target
+       SET val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT kind, payload FROM log ORDER BY seq;
+}
+expect {
+    before|1:a->x
+    after|1:x
+    before|2:b->y
+    after|2:y
+}
+
+# LEFT JOIN sources in the FROM clause should preserve unmatched rows from the
+# joined source graph and still drive the target update once per matched target.
+@cross-check-integrity
+test update-from-left-join-source-graph {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE b(k INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO a VALUES (1, 100), (2, 200), (3, 300);
+    INSERT INTO b VALUES (100, 7), (300, 9);
+    UPDATE target
+       SET val = COALESCE(b.bump, -1)
+      FROM a LEFT JOIN b ON a.k = b.k
+     WHERE target.id = a.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|7
+    2|-1
+    3|9
+}
+
+# Partial indexes must stay query-correct when UPDATE ... FROM moves rows in
+# and out of the index predicate while also changing indexed values.
+@cross-check-integrity
+test update-from-maintains-partial-index {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, flag INTEGER, val INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_flag INTEGER, new_val INTEGER);
+    CREATE INDEX target_partial ON target(val) WHERE flag = 1;
+    INSERT INTO target VALUES (1, 1, 10), (2, 0, 20), (3, 1, 30);
+    INSERT INTO src VALUES (1, 0, 100), (2, 1, 200), (3, 1, 300);
+    UPDATE target
+       SET flag = src.new_flag,
+           val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id FROM target WHERE flag = 1 AND val = 100 ORDER BY id;
+    SELECT id FROM target WHERE flag = 1 AND val = 200 ORDER BY id;
+    SELECT id FROM target WHERE flag = 1 AND val = 300 ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+# Expression indexes must also stay query-correct when values are replaced from
+# a FROM-side source.
+@cross-check-integrity
+test update-from-maintains-expression-index {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_val TEXT);
+    CREATE INDEX target_expr ON target(lower(val));
+    INSERT INTO target VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma');
+    INSERT INTO src VALUES (1, 'ONE'), (3, 'THREE');
+    UPDATE target
+       SET val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id FROM target WHERE lower(val) = 'one' ORDER BY id;
+    SELECT id FROM target WHERE lower(val) = 'beta' ORDER BY id;
+    SELECT id FROM target WHERE lower(val) = 'three' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Updating the INTEGER PRIMARY KEY from a FROM-side source must still fire
+# ON UPDATE CASCADE on child tables.
+@cross-check-integrity
+test update-from-rowid-update-cascades-foreign-keys {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON UPDATE CASCADE
+    );
+    CREATE TABLE src(old_id INTEGER PRIMARY KEY, new_id INTEGER);
+    INSERT INTO parent VALUES (1, 'a'), (2, 'b');
+    INSERT INTO child VALUES (10, 1), (20, 2);
+    INSERT INTO src VALUES (1, 11), (2, 22);
+    UPDATE parent
+       SET id = src.new_id
+      FROM src
+     WHERE parent.id = src.old_id;
+    SELECT id, parent_id FROM child ORDER BY id;
+}
+expect {
+    10|11
+    20|22
+}
+
+# OR IGNORE should keep rows that would conflict unchanged while still applying
+# non-conflicting source-driven updates.
+@cross-check-integrity
+test update-from-or-ignore-skips-conflicting-row {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_u TEXT, new_v INTEGER);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+    INSERT INTO src VALUES (1, 'b', 111), (2, 'z', 222);
+    UPDATE OR IGNORE target
+       SET u = src.new_u,
+           v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, u, v FROM target ORDER BY id;
+}
+expect {
+    1|a|10
+    2|z|222
+    3|c|30
+}
+
+# OR REPLACE should delete the conflicting row and apply the replacement row
+# chosen by the UPDATE ... FROM source.
+@cross-check-integrity
+test update-from-or-replace-deletes-conflicting-row {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_u TEXT, new_v INTEGER);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+    INSERT INTO src VALUES (1, 'b', 111), (2, 'z', 222);
+    UPDATE OR REPLACE target
+       SET u = src.new_u,
+           v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, u, v FROM target ORDER BY id;
+}
+expect {
+    1|b|111
+    3|c|30
+}
