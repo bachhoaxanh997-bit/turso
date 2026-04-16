@@ -22,7 +22,7 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
-use super::planner::{parse_where, plan_ctes_as_outer_refs};
+use super::planner::{parse_from, parse_where};
 use super::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
@@ -177,9 +177,6 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    if body.from.is_some() {
-        bail_parse_error!("FROM clause is not supported in UPDATE");
-    }
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
@@ -271,9 +268,42 @@ pub fn prepare_update_plan(
         indexed,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
+    let has_update_from = body.from.is_some();
+    let mut where_clause = vec![];
+    let mut vtab_predicates = vec![];
+    parse_from(
+        body.from.take(),
+        resolver,
+        program,
+        with,
+        true,
+        &mut where_clause,
+        &mut vtab_predicates,
+        &mut table_references,
+        connection,
+    )?;
 
-    // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+    let target_identifier = body.tbl_name.alias.as_ref().map_or_else(
+        || normalize_ident(body.tbl_name.name.as_str()),
+        |alias| normalize_ident(alias.as_str()),
+    );
+    let target_table_name = normalize_ident(body.tbl_name.name.as_str());
+    if table_references
+        .joined_tables()
+        .iter()
+        .skip(1)
+        .any(|joined| {
+            joined.identifier == target_identifier || joined.identifier == target_table_name
+        })
+    {
+        bail_parse_error!(
+            "target object/alias may not appear in FROM clause: {}",
+            body.tbl_name
+                .alias
+                .as_ref()
+                .map_or(body.tbl_name.name.as_str(), |alias| alias.as_str())
+        );
+    }
 
     let column_lookup: HashMap<String, usize> = table
         .columns()
@@ -389,17 +419,25 @@ pub fn prepare_update_plan(
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut non_from_clause_subqueries = vec![];
+    let mut returning_table_references = if has_update_from {
+        TableReferences::new(vec![table_references.joined_tables()[0].clone()], vec![])
+    } else {
+        table_references.clone()
+    };
     plan_subqueries_from_returning(
         program,
         &mut non_from_clause_subqueries,
-        &mut table_references,
+        &mut returning_table_references,
         &mut body.returning,
         resolver,
         connection,
     )?;
 
-    let result_columns =
-        process_returning_clause(&mut body.returning, &mut table_references, resolver)?;
+    let result_columns = process_returning_clause(
+        &mut body.returning,
+        &mut returning_table_references,
+        resolver,
+    )?;
 
     let order_by = body
         .order_by
@@ -421,7 +459,6 @@ pub fn prepare_update_plan(
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
     let columns = table.columns();
-    let mut where_clause = vec![];
     // Parse the WHERE clause
     parse_where(
         body.where_clause.as_deref(),

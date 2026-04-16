@@ -994,6 +994,7 @@ pub struct UpdateStmt {
     pub with_clause: Option<WithClause>,
     pub table: String,
     pub sets: Vec<(String, Expr)>,
+    pub from: Option<FromClause>,
     pub where_clause: Option<Expr>,
     pub conflict: Option<ConflictClause>,
 }
@@ -1014,6 +1015,13 @@ impl fmt::Display for UpdateStmt {
                 write!(f, ", ")?;
             }
             write!(f, "{col} = {val}")?;
+        }
+
+        if let Some(from) = &self.from {
+            write!(f, " FROM {}", from.table)?;
+            if let Some(alias) = &from.alias {
+                write!(f, " AS {alias}")?;
+            }
         }
 
         if let Some(where_clause) = &self.where_clause {

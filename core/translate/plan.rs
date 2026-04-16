@@ -698,6 +698,9 @@ impl SelectPlan {
 /// Why an UPDATE/DELETE must gather target rowids first, then apply writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmlSafetyReason {
+    /// UPDATE ... FROM computes writes from a joined rowset, so we must
+    /// materialize that rowset before mutating the target table.
+    UpdateFrom,
     /// Triggers exist, so we lock in target rows before writing.
     Trigger,
     /// WHERE has a subquery, so we lock in target rows before writing.

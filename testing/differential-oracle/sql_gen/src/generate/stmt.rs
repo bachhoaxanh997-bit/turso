@@ -381,7 +381,25 @@ pub fn generate_update<C: Capabilities>(
         return Err(GenError::schema_empty("columns"));
     }
 
-    ctx.with_table_scope([(table.clone(), None)], |ctx| {
+    let from = if ctx.gen_bool_with_prob(update_config.from_probability) {
+        generate_update_from(generator, ctx, &table)?
+    } else {
+        None
+    };
+
+    let mut scope_tables = vec![(table.clone(), None)];
+    if let Some(from_clause) = &from {
+        let from_table = generator
+            .schema()
+            .tables
+            .iter()
+            .find(|candidate| candidate.qualified_name() == from_clause.table)
+            .cloned()
+            .ok_or_else(|| GenError::exhausted("update_from", "selected table not in schema"))?;
+        scope_tables.push((from_table, from_clause.alias.clone()));
+    }
+
+    ctx.with_table_scope(scope_tables, |ctx| {
         // Generate conflict clause
         let conflict = generate_conflict_clause(
             ctx,
@@ -398,12 +416,6 @@ pub fn generate_update<C: Capabilities>(
         } else {
             None
         };
-
-        // --- UPDATE ... FROM (not yet implemented) ---
-        if ctx.gen_bool_with_prob(update_config.from_probability) {
-            let _ = generate_update_from(generator, ctx);
-        }
-
         // --- RETURNING (not yet implemented) ---
         if ctx.gen_bool_with_prob(update_config.returning_probability) {
             let _ = generate_update_returning(generator, ctx);
@@ -413,6 +425,7 @@ pub fn generate_update<C: Capabilities>(
             with_clause: with_clause.clone(),
             table: table.qualified_name(),
             sets,
+            from,
             where_clause,
             conflict,
         }))
@@ -1221,10 +1234,27 @@ fn generate_insert_returning<C: Capabilities>(
 
 #[trace_gen(Origin::UpdateFrom)]
 fn generate_update_from<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<(), GenError> {
-    todo!("UPDATE ... FROM generation")
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    target_table: &crate::schema::Table,
+) -> Result<Option<crate::ast::FromClause>, GenError> {
+    let candidates: Vec<_> = generator
+        .schema()
+        .tables
+        .iter()
+        .filter(|table| table.qualified_name() != target_table.qualified_name())
+        .cloned()
+        .collect();
+
+    let from_table = ctx
+        .choose(&candidates)
+        .ok_or_else(|| GenError::exhausted("update_from", "no non-target table available"))?
+        .clone();
+
+    Ok(Some(crate::ast::FromClause {
+        table: from_table.qualified_name(),
+        alias: None,
+    }))
 }
 
 #[trace_gen(Origin::UpdateReturning)]
@@ -1672,6 +1702,44 @@ mod tests {
             }
         }
         assert!(found_cte, "Should generate UPDATE with CTE");
+    }
+
+    #[test]
+    fn test_update_with_from() {
+        let policy = Policy::default().with_update_config(crate::policy::UpdateConfig {
+            from_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .table(Table::new(
+                "posts",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("user_id", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_from = false;
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(stmt) = generate_update(&generator, &mut ctx) {
+                let sql = stmt.to_string();
+                if sql.starts_with("UPDATE") && sql.contains(" FROM ") {
+                    found_from = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_from, "Should generate UPDATE with FROM");
     }
 
     #[test]
