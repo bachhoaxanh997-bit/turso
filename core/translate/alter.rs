@@ -876,7 +876,7 @@ pub fn translate_alter_table(
             // Check if any virtual column depends on the dropped column
             {
                 let affected =
-                    crate::schema::columns_affected_by_update(&btree.columns, [dropped_index]);
+                    btree.columns_affected_by_update([dropped_index]);
                 for idx in &affected {
                     if idx != dropped_index && btree.columns[idx].is_virtual_generated() {
                         return Err(LimboError::ParseError(format!(

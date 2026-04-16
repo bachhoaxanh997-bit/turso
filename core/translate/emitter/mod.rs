@@ -19,7 +19,6 @@ use super::order_by::SortMetadata;
 use super::plan::{BitSet, HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
-use crate::schema::dependencies_of_columns;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
@@ -1642,7 +1641,7 @@ pub(crate) fn emit_columns_and_dependencies(
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
 ) -> DmlColumnContext {
-    let dependencies = dependencies_of_columns(&table.columns, target_columns);
+    let dependencies = table.dependencies_of_columns(target_columns);
     let base = program.alloc_registers(dependencies.count());
     let mut next_reg = base;
     let pairs = table.columns.iter().enumerate().map(|(idx, col)| {

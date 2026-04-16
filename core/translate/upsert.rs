@@ -6,9 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{
-    columns_affected_by_update, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
-};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -667,7 +665,7 @@ pub fn emit_upsert(
     // Expand to include virtual columns that transitively depend on SET columns,
     // so that indexes on virtual columns are correctly updated.
     let changed_cols = if ctx.table.has_virtual_columns() {
-        columns_affected_by_update(table.columns(), &changed_cols)
+        ctx.table.columns_affected_by_update(&changed_cols)
     } else {
         changed_cols
     };

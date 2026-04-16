@@ -2638,6 +2638,68 @@ impl BTreeTable {
 
         Ok(())
     }
+
+    pub(crate) fn columns_affected_by_update(
+        &self,
+        updated_cols: impl IntoIterator<Item = usize>,
+    ) -> ColumnMask {
+        let mut affected = ColumnMask::default();
+        for idx in updated_cols {
+            affected.set(idx);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (idx, col) in self.columns.iter().enumerate() {
+                if affected.get(idx) {
+                    continue;
+                }
+                let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+                    continue;
+                };
+                if expr_refers_one_of(expr, &self.columns, &affected) {
+                    affected.set(idx);
+                    changed = true;
+                }
+            }
+        }
+        affected
+    }
+
+    /// Returns a bitset containing the indexes of `targets` and of the stored columns that the
+    /// virtual columns in `targets` depend on.
+    pub(crate) fn dependencies_of_columns(
+        &self,
+        targets: impl IntoIterator<Item = usize>,
+    ) -> ColumnUsedMask {
+        let mut dependencies = BitSet::default();
+        let mut visited = BitSet::default();
+        let mut pending = BitSet::default();
+        for idx in targets {
+            pending.set(idx);
+        }
+        loop {
+            let mut next = BitSet::default();
+            for idx in pending.iter() {
+                if visited.get(idx) {
+                    continue;
+                }
+                visited.set(idx);
+                if let GeneratedType::Virtual { ref expr, .. } =
+                    self.columns[idx].generated_type()
+                {
+                    collect_column_dependencies_of_gencol(expr, &self.columns, &mut next);
+                } else {
+                    dependencies.set(idx);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            pending = next;
+        }
+        dependencies
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2760,94 +2822,32 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
     refs
 }
 
-//TODO this computation be replaced with a table-level cache of column->dependencies, and then
-// columns_affected_by_update could just do a union of the dependencies of all columns.
-pub(crate) fn columns_affected_by_update(
-    columns: &[Column],
-    updated_cols: impl IntoIterator<Item = usize>,
-) -> ColumnMask {
-    let mut affected = ColumnMask::default();
-    for idx in updated_cols {
-        affected.set(idx);
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (idx, col) in columns.iter().enumerate() {
-            if affected.get(idx) {
-                continue;
+fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
+    let _ = walk_expr(expr, &mut |e| {
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                out.set(*column);
             }
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
-                continue;
-            };
-            if expr_refers_one_of(expr, columns, &affected) {
-                affected.set(idx);
-                changed = true;
+            Expr::Id(name) | Expr::Name(name) => {
+                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
+                    out.set(idx);
+                }
             }
+            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
+                    out.set(idx);
+                }
+            }
+            Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InTable { .. }
+            | Expr::SubqueryResult { .. } => {
+                unreachable!("generated columns cannot contain subqueries")
+            }
+            _ => {}
         }
-    }
-    affected
-}
-
-/// returns a bitset containing the indexes of `targets` and of the stored columns that the
-/// virtual columns in `targets` depend on.
-pub(crate) fn dependencies_of_columns(
-    columns: &[Column],
-    targets: impl IntoIterator<Item = usize>,
-) -> ColumnUsedMask {
-    fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
-        let _ = walk_expr(expr, &mut |e| {
-            match e {
-                Expr::Column { table, column, .. } if table.is_self_table() => {
-                    out.set(*column);
-                }
-                Expr::Id(name) | Expr::Name(name) => {
-                    if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                        out.set(idx);
-                    }
-                }
-                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                        out.set(idx);
-                    }
-                }
-                Expr::Subquery(_)
-                | Expr::Exists(_)
-                | Expr::InTable { .. }
-                | Expr::SubqueryResult { .. } => {
-                    unreachable!("generated columns cannot contain subqueries")
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        });
-    }
-
-    let mut dependencies = BitSet::default();
-    let mut visited = BitSet::default();
-    let mut pending = BitSet::default();
-    for idx in targets {
-        pending.set(idx);
-    }
-    loop {
-        let mut next = BitSet::default();
-        for idx in pending.iter() {
-            if visited.get(idx) {
-                continue;
-            }
-            visited.set(idx);
-            if let GeneratedType::Virtual { ref expr, .. } = columns[idx].generated_type() {
-                collect_column_dependencies_of_gencol(expr, columns, &mut next);
-            } else {
-                dependencies.set(idx);
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        pending = next;
-    }
-    dependencies
+        Ok(WalkControl::Continue)
+    });
 }
 
 /// Returns true if `expr` references any column in `target_set`.
@@ -3731,7 +3731,7 @@ impl ResolvedFkRef {
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
             return true;
         }
-        let affected = columns_affected_by_update(&parent_tbl.columns, updated_parent_positions);
+        let affected = parent_tbl.columns_affected_by_update(updated_parent_positions);
         self.parent_pos.iter().any(|p| affected.get(*p))
     }
 
