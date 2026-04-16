@@ -656,6 +656,21 @@ expect {
     2|3|1
 }
 
+@cross-check-integrity
+test update-with-trigger-and-index-scan-preserves-unchanged-indexed-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t_a ON t(a);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t VALUES (1, 1, 10, 100), (2, 2, 20, 200), (3, 3, 30, 300);
+    UPDATE t SET b = b + 1 WHERE a = 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1|10|100
+    2|2|21|200
+    3|3|30|300
+}
+
 # https://github.com/tursodatabase/turso/issues/3276
 @cross-check-integrity
 test can-update-rowid-directly {

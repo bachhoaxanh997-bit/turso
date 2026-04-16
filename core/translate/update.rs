@@ -212,6 +212,9 @@ fn validate_update(
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
+    if body.from.is_some() && body.limit.is_some() {
+        bail_parse_error!("LIMIT is not supported in UPDATE FROM");
+    }
     // Check if this is a materialized view
     if schema.is_materialized_view(table_name) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
@@ -320,17 +323,23 @@ pub fn prepare_update_plan(
         |alias| normalize_ident(alias.as_str()),
     );
     let target_table_name = normalize_ident(body.tbl_name.name.as_str());
-    if table_references
-        .joined_tables()
-        .iter()
-        .skip(1)
-        .any(|joined| {
-            joined.identifier == target_identifier
-                || (body.tbl_name.alias.is_none()
-                    && normalize_ident(joined.table.get_name()) == target_table_name
-                    && joined.identifier == target_table_name)
-        })
-    {
+    let illegal_target_reference = if body.tbl_name.alias.is_some() {
+        table_references
+            .joined_tables()
+            .iter()
+            .skip(1)
+            .any(|joined| joined.identifier == target_identifier)
+    } else {
+        table_references
+            .joined_tables()
+            .iter()
+            .skip(1)
+            .any(|joined| {
+                normalize_ident(joined.table.get_name()) == target_table_name
+                    && joined.identifier == target_table_name
+            })
+    };
+    if illegal_target_reference {
         bail_parse_error!(
             "target object/alias may not appear in FROM clause: {}",
             body.tbl_name

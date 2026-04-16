@@ -373,11 +373,11 @@ pub fn emit_program_for_update(
     };
 
     // Emit update instructions
-    let effective_set_clauses = plan
+    let emitted_set_value_sources = plan
         .materialized_set_clauses
         .as_deref()
         .unwrap_or(&plan.set_clauses);
-    debug_assert!(
+    turso_assert!(
         plan.materialized_set_clauses
             .as_ref()
             .is_none_or(|materialized| {
@@ -392,7 +392,7 @@ pub fn emit_program_for_update(
     emit_update_insns(
         connection,
         &mut plan.table_references,
-        effective_set_clauses,
+        emitted_set_value_sources,
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
@@ -863,14 +863,14 @@ fn emit_update_insns<'a>(
         .expect("loop labels to exist");
     // Label to skip to the next row on conflict (for IGNORE mode)
     let skip_row_label = loop_labels.next;
-    let access_table = if has_ephemeral_table {
-        target_table.as_ref()
-    } else {
-        table_references
-            .joined_tables()
-            .first()
-            .expect("UPDATE must have a source table")
-    };
+    // Consult the active iteration source, not the original target scan. In the
+    // prebuilt-ephemeral path `table_references` has already been rewritten to
+    // the scratch table; reusing the optimizer-chosen target scan here would
+    // read unchanged columns via stale index cursors from the collection phase.
+    let access_table = table_references
+        .joined_tables()
+        .first()
+        .expect("UPDATE must have a source table");
     let (index, is_virtual_table) = match &access_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {

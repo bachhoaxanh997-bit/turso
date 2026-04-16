@@ -771,7 +771,7 @@ fn optimize_update_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let schema = resolver.schema();
-    let is_update_from = plan.is_update_from();
+    let is_update_from = plan.has_from_clause;
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
@@ -939,12 +939,33 @@ fn first_update_safety_reason(
     Ok(reason)
 }
 
+fn collect_subquery_result_ids_from_returning(
+    returning: Option<&[ResultSetColumn]>,
+) -> Result<HashSet<turso_parser::ast::TableInternalId>> {
+    use crate::translate::expr::walk_expr;
+    use crate::translate::expr::WalkControl;
+
+    let mut ids = HashSet::default();
+    let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+            ids.insert(*subquery_id);
+        }
+        Ok(WalkControl::Continue)
+    };
+    if let Some(returning) = returning {
+        for rc in returning {
+            walk_expr(&rc.expr, &mut collector)?;
+        }
+    }
+    Ok(ids)
+}
+
 /// Collect SubqueryResult IDs referenced in SET clause and RETURNING expressions.
 /// These subqueries must stay in the main update plan (evaluated during the update phase),
 /// not be moved to the ephemeral plan (which only collects rowids).
 fn collect_update_phase_subquery_ids(
     plan: &UpdatePlan,
-) -> HashSet<turso_parser::ast::TableInternalId> {
+) -> Result<HashSet<turso_parser::ast::TableInternalId>> {
     use crate::translate::expr::walk_expr;
     use crate::translate::expr::WalkControl;
 
@@ -956,14 +977,12 @@ fn collect_update_phase_subquery_ids(
         Ok(WalkControl::Continue)
     };
     for (_, expr) in plan.set_clauses.iter() {
-        let _ = walk_expr(expr, &mut collector);
+        walk_expr(expr, &mut collector)?;
     }
-    if let Some(returning) = &plan.returning {
-        for rc in returning {
-            let _ = walk_expr(&rc.expr, &mut collector);
-        }
-    }
-    ids
+    ids.extend(collect_subquery_result_ids_from_returning(
+        plan.returning.as_deref(),
+    )?);
+    Ok(ids)
 }
 
 fn update_from_ephemeral_columns(plan: &UpdatePlan) -> Vec<Column> {
@@ -971,6 +990,8 @@ fn update_from_ephemeral_columns(plan: &UpdatePlan) -> Vec<Column> {
         .iter()
         .enumerate()
         .map(|(idx, _)| {
+            // Keep scratch-table columns at BLOB affinity so materializing SET payloads
+            // does not coerce values before the real target-column affinity is applied.
             Column::new(
                 Some(format!("__update_from_{idx}")),
                 "BLOB".to_string(),
@@ -1004,7 +1025,7 @@ fn add_ephemeral_table_to_update_plan(
     update_from_result_columns: Vec<ResultSetColumn>,
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
-    let is_update_from = plan.is_update_from();
+    let is_update_from = plan.has_from_clause;
     let columns = if is_update_from {
         update_from_ephemeral_columns(plan)
     } else {
@@ -1124,24 +1145,9 @@ fn add_ephemeral_table_to_update_plan(
         // RETURNING subqueries always remain in the main update plan.
         non_from_clause_subqueries: {
             let update_phase_ids = if is_update_from {
-                let mut ids = HashSet::default();
-                if let Some(returning) = &plan.returning {
-                    use crate::translate::expr::walk_expr;
-                    use crate::translate::expr::WalkControl;
-
-                    let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
-                        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
-                            ids.insert(*subquery_id);
-                        }
-                        Ok(WalkControl::Continue)
-                    };
-                    for rc in returning {
-                        let _ = walk_expr(&rc.expr, &mut collector);
-                    }
-                }
-                ids
+                collect_subquery_result_ids_from_returning(plan.returning.as_deref())?
             } else {
-                collect_update_phase_subquery_ids(plan)
+                collect_update_phase_subquery_ids(plan)?
             };
             let mut ephemeral_subs = Vec::new();
             let mut remaining = Vec::new();

@@ -798,12 +798,6 @@ pub struct UpdatePlan {
     pub safety: DmlSafety,
 }
 
-impl UpdatePlan {
-    pub fn is_update_from(&self) -> bool {
-        self.has_from_clause
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IterationDirection {
     Forwards,

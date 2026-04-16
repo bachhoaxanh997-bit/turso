@@ -281,6 +281,18 @@ expect {
     4|2|child-a->grandchild
 }
 
+# Unaliased self-reference in FROM is illegal when the target is also unaliased.
+test update-from-self-reference-unaliased-errors {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    UPDATE t
+       SET v = 1
+      FROM t
+     WHERE t.id = t.id;
+}
+expect error {
+}
+
 # Three-table FROM list (comma-join).
 @cross-check-integrity
 test update-from-three-tables {
@@ -321,6 +333,35 @@ expect {
     2|26
 }
 
+@cross-check-integrity
+test update-from-returning-star {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 5), (2, 6);
+    UPDATE target SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING *;
+}
+expect {
+    1|15
+    2|26
+}
+
+test update-from-returning-may-not-reference-source-columns {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10);
+    INSERT INTO src VALUES (1, 5);
+    UPDATE target SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING src.bump;
+}
+expect error {
+}
+
 # UPDATE ... FROM must still evaluate scalar subqueries in SET.
 @cross-check-integrity
 test update-from-set-subquery {
@@ -338,6 +379,23 @@ test update-from-set-subquery {
 expect {
     1|42
     2|42
+}
+
+@cross-check-integrity
+test update-from-row-value-set {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE TABLE src (id INTEGER, x TEXT, y INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1), (2, 'older', 2);
+    INSERT INTO src VALUES (1, 'new', 10), (2, 'newer', 20);
+    UPDATE target
+       SET (a, b) = (src.x, src.y)
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, a, b FROM target ORDER BY id;
+}
+expect {
+    1|new|10
+    2|newer|20
 }
 
 # RETURNING subqueries may still reference statement-scoped CTEs.
@@ -409,6 +467,19 @@ expect {
     1||root
     2|1|root->child-a
     3|1|root->child-b
+}
+
+test update-from-limit-errors {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 1), (2, 2);
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     LIMIT 1;
+}
+expect error {
 }
 
 # Updating a column that is also an indexed column — indexes must be maintained.
