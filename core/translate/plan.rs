@@ -1395,6 +1395,10 @@ impl ColumnMask {
     pub fn is_empty(&self) -> bool {
         self.bitset.is_empty() && !self.has_rowid_sentinel
     }
+
+    pub fn iter(&self) -> ColumnMaskIter<&BitSet> {
+        self.into_iter()
+    }
 }
 
 impl FromIterator<usize> for ColumnMask {

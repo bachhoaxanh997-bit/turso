@@ -142,7 +142,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, ColumnUsedMask, Plan, TableReferences};
+use crate::translate::plan::{ColumnMask, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -2791,11 +2791,16 @@ pub(crate) fn columns_affected_by_update(
 
 /// returns a bitset containing the indexes of `targets` and of the stored columns that the
 /// virtual columns in `targets` depend on.
+//TODO this needs to be cached, similarly to columns_affected_by_update
 pub(crate) fn dependencies_of_columns(
     columns: &[Column],
     targets: impl IntoIterator<Item = usize>,
-) -> ColumnUsedMask {
-    fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
+) -> ColumnMask {
+    fn collect_column_dependencies_of_gencol(
+        expr: &Expr,
+        columns: &[Column],
+        out: &mut ColumnMask,
+    ) {
         let _ = walk_expr(expr, &mut |e| {
             match e {
                 Expr::Column { table, column, .. } if table.is_self_table() => {
@@ -2823,14 +2828,14 @@ pub(crate) fn dependencies_of_columns(
         });
     }
 
-    let mut dependencies = BitSet::default();
-    let mut visited = BitSet::default();
-    let mut pending = BitSet::default();
+    let mut dependencies = ColumnMask::default();
+    let mut visited = ColumnMask::default();
+    let mut pending = ColumnMask::default();
     for idx in targets {
         pending.set(idx);
     }
     loop {
-        let mut next = BitSet::default();
+        let mut next = ColumnMask::default();
         for idx in pending.iter() {
             if visited.get(idx) {
                 continue;

@@ -7,7 +7,8 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{
-    columns_affected_by_update, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
+    columns_affected_by_update, dependencies_of_columns, BTreeTable, ColumnLayout, IndexColumn,
+    ROWID_SENTINEL,
 };
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -20,6 +21,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
+use crate::vdbe::builder::SelfTableContext;
 use crate::vdbe::insn::{to_u16, CmpInsFlags};
 use crate::{
     bail_parse_error,
@@ -191,13 +193,8 @@ fn upsert_index_is_affected(
     if rowid_changed {
         return true;
     }
-    let km: ColumnMask = idx
-        .columns
-        .iter()
-        .filter_map(|ic| ic.expr.is_none().then_some(ic.pos_in_table))
-        .collect();
-    let pm = referenced_index_cols(idx, table);
-    for c in km.into_iter().chain(pm.into_iter()) {
+
+    for c in referenced_index_cols(idx, table) {
         if changed_cols.get(c) {
             return true;
         }
@@ -208,16 +205,19 @@ fn upsert_index_is_affected(
 /// Collect the set of columns referenced by the partial WHERE (empty if none), or
 /// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> ColumnMask {
-    let mut out = ColumnMask::default();
+    let mut referenced_cols = ColumnMask::default();
+
     if let Some(expr) = &idx.where_clause {
-        index_expression_cols(table, &mut out, expr);
+        index_expression_cols(table, &mut referenced_cols, expr);
     }
     for ic in &idx.columns {
         if let Some(expr) = &ic.expr {
-            index_expression_cols(table, &mut out, expr);
+            index_expression_cols(table, &mut referenced_cols, expr);
+        } else {
+            referenced_cols.set(ic.pos_in_table);
         }
     }
-    out
+    dependencies_of_columns(table.columns(), referenced_cols)
 }
 
 /// Columns referenced by any expression index columns on the index.
@@ -249,6 +249,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                     }
                 }
             }
+            Expr::Column { column, .. } => out.set(*column),
             _ => {}
         }
         Ok(WalkControl::Continue)
@@ -829,6 +830,24 @@ pub fn emit_upsert(
 
     // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
     if let Some(before) = before_start {
+        let has_virtual = table.btree().is_some_and(|btree| btree.has_virtual_columns);
+        let before_ctx = has_virtual.then(|| {
+            SelfTableContext::ForDML(DmlColumnContext::layout(
+                table.columns(),
+                before,
+                ctx.conflict_rowid_reg,
+                layout.clone(),
+            ))
+        });
+        let after_ctx = has_virtual.then(|| {
+            SelfTableContext::ForDML(DmlColumnContext::layout(
+                table.columns(),
+                new_start,
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                layout.clone(),
+            ))
+        });
+
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
@@ -882,14 +901,16 @@ pub fn emit_upsert(
                         None,
                         &layout,
                     )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        None,
-                        &e,
-                        del + i,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
+                    program.with_self_table_context(before_ctx.as_ref(), |program, _| {
+                        translate_expr_no_constant_opt(
+                            program,
+                            None,
+                            &e,
+                            del + i,
+                            resolver,
+                            NoConstantOptReason::RegisterReuse,
+                        )
+                    })?;
                 } else {
                     let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
                     program.emit_insn(Insn::Copy {
@@ -941,14 +962,16 @@ pub fn emit_upsert(
                         None,
                         &layout,
                     )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        None,
-                        &e,
-                        ins + i,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
+                    program.with_self_table_context(after_ctx.as_ref(), |program, _| {
+                        translate_expr_no_constant_opt(
+                            program,
+                            None,
+                            &e,
+                            ins + i,
+                            resolver,
+                            NoConstantOptReason::RegisterReuse,
+                        )
+                    })?;
                 } else {
                     let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
                     program.emit_insn(Insn::Copy {
