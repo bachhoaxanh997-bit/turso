@@ -33,7 +33,7 @@ use crate::{
         plan::{
             ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent, SubqueryState,
+            SeekKeyComponent, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
         },
         trigger_exec::has_triggers_including_temp,
     },
@@ -1186,6 +1186,10 @@ fn add_ephemeral_table_to_update_plan(
                 if update_phase_ids.contains(&sq.internal_id) {
                     remaining.push(sq);
                 } else {
+                    let mut sq = sq;
+                    if is_update_from && sq.origin == SubqueryOrigin::DmlSet {
+                        sq.eval_phase = SubqueryEvalPhase::BeforeLoop;
+                    }
                     ephemeral_subs.push(sq);
                 }
             }

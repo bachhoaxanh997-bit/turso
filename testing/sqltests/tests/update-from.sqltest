@@ -261,6 +261,44 @@ expect {
     2|26
 }
 
+# UPDATE ... FROM must still evaluate scalar subqueries in SET.
+@cross-check-integrity
+test update-from-set-subquery {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 0), (2, 0);
+    INSERT INTO src VALUES (1, 7), (2, 8);
+    WITH c(x) AS (SELECT 42)
+    UPDATE target
+       SET val = (SELECT x FROM c)
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|42
+    2|42
+}
+
+# RETURNING subqueries may still reference statement-scoped CTEs.
+@cross-check-integrity
+test update-from-returning-subquery-can-see-cte {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 5), (2, 6);
+    WITH c(x) AS (SELECT 42)
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING id, (SELECT x FROM c);
+}
+expect {
+    1|42
+    2|42
+}
+
 # Aliasing the target in UPDATE and referring to the alias in SET/WHERE.
 @cross-check-integrity
 test update-from-target-alias {
@@ -276,6 +314,24 @@ test update-from-target-alias {
 expect {
     1|110
     2|220
+}
+
+# Once the target is aliased, a FROM-side alias may reuse the base table name.
+@cross-check-integrity
+test update-from-target-alias-allows-source-alias-matching-base-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE u (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    INSERT INTO u VALUES (1, 100), (2, 200);
+    UPDATE t AS x
+       SET val = t.val
+      FROM u AS t
+     WHERE x.id = t.id;
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|200
 }
 
 # Updating a column that is also an indexed column — indexes must be maintained.
@@ -338,6 +394,22 @@ test update-from-duplicate-match-keeps-set-columns-consistent {
 }
 expect {
     1|1
+}
+
+# Virtual-table/table-valued-function arguments from FROM must be preserved.
+@cross-check-integrity
+test update-from-vtab-source-arguments {
+    CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO dst VALUES (0, 'a'), (1, 'b');
+    UPDATE dst
+       SET val = p.name
+      FROM pragma_table_info('dst') AS p
+     WHERE dst.id = p.cid;
+    SELECT id, val FROM dst ORDER BY id;
+}
+expect {
+    0|id
+    1|val
 }
 
 # Regression for differential fuzzing: dead UPDATE ... FROM statements must not

@@ -20,7 +20,8 @@ use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, ResultSetColumn,
+    TableReferences, UpdatePlan, WhereTerm,
 };
 use super::planner::{parse_from, parse_where};
 use super::subquery::{
@@ -293,7 +294,9 @@ pub fn prepare_update_plan(
         .iter()
         .skip(1)
         .any(|joined| {
-            joined.identifier == target_identifier || joined.identifier == target_table_name
+            joined.identifier == target_identifier
+                || (normalize_ident(joined.table.get_name()) == target_table_name
+                    && joined.identifier == target_table_name)
         })
     {
         bail_parse_error!(
@@ -420,7 +423,10 @@ pub fn prepare_update_plan(
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut non_from_clause_subqueries = vec![];
     let mut returning_table_references = if has_update_from {
-        TableReferences::new(vec![table_references.joined_tables()[0].clone()], vec![])
+        TableReferences::new(
+            vec![table_references.joined_tables()[0].clone()],
+            table_references.outer_query_refs().to_vec(),
+        )
     } else {
         table_references.clone()
     };
@@ -459,6 +465,13 @@ pub fn prepare_update_plan(
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
     let columns = table.columns();
+    add_vtab_predicates_to_where_clause(
+        &mut vtab_predicates,
+        &mut table_references,
+        &result_columns,
+        &mut where_clause,
+        resolver,
+    )?;
     // Parse the WHERE clause
     parse_where(
         body.where_clause.as_deref(),
@@ -574,5 +587,50 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
         }),
         Table::Virtual(_) => Operation::default_scan_for(table),
         _ => unreachable!(),
+    }
+}
+
+fn add_vtab_predicates_to_where_clause(
+    vtab_predicates: &mut Vec<Expr>,
+    table_references: &mut TableReferences,
+    result_columns: &[ResultSetColumn],
+    out_where_clause: &mut Vec<WhereTerm>,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    for expr in vtab_predicates.iter_mut() {
+        bind_and_rewrite_expr(
+            expr,
+            Some(table_references),
+            Some(result_columns),
+            resolver,
+            BindingBehavior::TryCanonicalColumnsFirst,
+        )?;
+    }
+    for expr in vtab_predicates.drain(..) {
+        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
+            table_references
+                .find_joined_table_by_internal_id(table_id)
+                .and_then(|t| {
+                    t.join_info
+                        .as_ref()
+                        .and_then(|ji| ji.is_outer().then_some(table_id))
+                })
+        });
+        out_where_clause.push(WhereTerm {
+            expr,
+            from_outer_join,
+            consumed: false,
+        });
+    }
+    Ok(())
+}
+
+fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
+    match expr {
+        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
+            Expr::Column { table, .. } => Some(*table),
+            _ => None,
+        },
+        _ => None,
     }
 }
