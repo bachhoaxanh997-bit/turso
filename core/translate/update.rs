@@ -305,6 +305,14 @@ pub fn prepare_update_plan(
         connection,
     )?;
 
+    // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
+    // a column name that already appears in another FROM-side table without being
+    // deduplicated. This proactive check mirrors what SQLite does even when no
+    // unqualified column reference appears in the query.
+    if has_from_clause {
+        check_update_from_column_ambiguity(table_references.joined_tables())?;
+    }
+
     let target_identifier = body.tbl_name.alias.as_ref().map_or_else(
         || normalize_ident(body.tbl_name.name.as_str()),
         |alias| normalize_ident(alias.as_str()),
@@ -653,4 +661,50 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
         },
         _ => None,
     }
+}
+
+/// Proactive column-ambiguity check for UPDATE FROM.
+///
+/// SQLite rejects UPDATE FROM when a NATURAL JOIN (or USING) introduces a column
+/// name that also exists in another FROM-side table without deduplication. In a
+/// regular SELECT this is only caught when an unqualified reference is resolved,
+/// but UPDATE FROM checks it eagerly regardless of whether the column is referenced.
+fn check_update_from_column_ambiguity(joined_tables: &[JoinedTable]) -> crate::Result<()> {
+    for (i, table) in joined_tables.iter().enumerate() {
+        let using = match &table.join_info {
+            Some(info) if !info.using.is_empty() => &info.using,
+            _ => continue,
+        };
+        for using_col in using {
+            let col_name = normalize_ident(using_col.as_str());
+            // Count how many preceding FROM-side tables expose this column
+            // without it already being deduplicated by their own USING clause.
+            // Skip joined_tables[0] — it is the UPDATE target, not a FROM table.
+            let mut found_count = 0usize;
+            for preceding in &joined_tables[1..i] {
+                let has_col = preceding.columns().iter().any(|c| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                });
+                if !has_col {
+                    continue;
+                }
+                // If this preceding table's own USING already covers the column,
+                // it was deduplicated by an earlier NATURAL/USING JOIN — skip it.
+                let already_deduped = preceding.join_info.as_ref().is_some_and(|info| {
+                    info.using
+                        .iter()
+                        .any(|u| u.as_str().eq_ignore_ascii_case(&col_name))
+                });
+                if !already_deduped {
+                    found_count += 1;
+                }
+            }
+            if found_count > 1 {
+                bail_parse_error!("ambiguous column name: {}", using_col.as_str());
+            }
+        }
+    }
+    Ok(())
 }

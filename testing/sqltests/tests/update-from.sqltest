@@ -1412,3 +1412,24 @@ expect {
     2|10
     3|30
 }
+
+# ─── Adversarial: NATURAL JOIN inside UPDATE FROM ───
+
+# A regular JOIN followed by a NATURAL JOIN in the FROM clause merges
+# column names from the NATURAL JOIN. SQLite rejects this with
+# "ambiguous column name" even when no bare column reference appears,
+# because the merged NATURAL JOIN columns conflict with identically-named
+# columns from the preceding JOIN. Turso must reject it too.
+test update-from-natural-join-after-join-is-ambiguous {
+    CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO u VALUES(1, 'x');
+    UPDATE t SET y = 'z'
+      FROM u AS u1
+      JOIN u AS u2 ON u1.b = u2.b
+      NATURAL JOIN u AS u3
+     WHERE t.y = u1.b;
+}
+expect error {
+}
