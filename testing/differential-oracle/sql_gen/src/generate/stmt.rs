@@ -381,25 +381,42 @@ pub fn generate_update<C: Capabilities>(
         return Err(GenError::schema_empty("columns"));
     }
 
-    let from = if ctx.gen_bool_with_prob(update_config.from_probability) {
+    let from_result = if ctx.gen_bool_with_prob(update_config.from_probability) {
         generate_update_from(generator, ctx, &table)?
     } else {
         None
     };
 
-    let mut scope_tables = vec![(table.clone(), None)];
+    // Target table alias (UPDATE t AS x SET x.col = ...) — only when FROM is present
+    let target_alias = if from_result.is_some()
+        && ctx.gen_bool_with_prob(update_config.target_alias_probability)
+    {
+        Some(ctx.next_table_alias())
+    } else {
+        None
+    };
+
+    // Build the scope: target table (with optional alias), FROM table, JOIN tables
+    let mut scope_tables = vec![(table.clone(), target_alias.clone())];
     let mut from_table_for_scope = None;
-    if let Some(from_clause) = &from {
-        let from_table = generator
-            .schema()
-            .tables
-            .iter()
-            .find(|candidate| candidate.qualified_name() == from_clause.table)
-            .cloned()
-            .ok_or_else(|| GenError::exhausted("update_from", "selected table not in schema"))?;
-        from_table_for_scope = Some(from_table.clone());
-        scope_tables.push((from_table, from_clause.alias.clone()));
-    }
+    let (from_clause, joins) = if let Some(ref result) = from_result {
+        from_table_for_scope = Some(result.from_table.clone());
+        scope_tables.push((result.from_table.clone(), result.from_clause.alias.clone()));
+        // Add any JOIN tables to scope
+        for join in &result.joins {
+            if let Some(join_table) = generator
+                .schema()
+                .tables
+                .iter()
+                .find(|t| t.qualified_name() == join.table)
+            {
+                scope_tables.push((join_table.clone(), join.alias.clone()));
+            }
+        }
+        (Some(result.from_clause.clone()), result.joins.clone())
+    } else {
+        (None, vec![])
+    };
 
     ctx.with_table_scope(scope_tables, |ctx| {
         // Generate conflict clause
@@ -414,13 +431,13 @@ pub fn generate_update<C: Capabilities>(
 
         // Generate optional WHERE clause
         let where_clause =
-            if let (Some(from_clause), Some(from_table)) = (&from, &from_table_for_scope) {
+            if let (Some(fc), Some(from_table)) = (&from_clause, &from_table_for_scope) {
                 generate_update_from_where_clause(
                     generator,
                     ctx,
                     &table,
                     from_table,
-                    from_clause.alias.as_deref(),
+                    fc.alias.as_deref(),
                     update_config.where_probability,
                 )?
             } else if ctx.gen_bool_with_prob(update_config.where_probability) {
@@ -428,18 +445,24 @@ pub fn generate_update<C: Capabilities>(
             } else {
                 None
             };
-        // --- RETURNING (not yet implemented) ---
-        if ctx.gen_bool_with_prob(update_config.returning_probability) {
-            let _ = generate_update_returning(generator, ctx);
-        }
+
+        // --- RETURNING ---
+        let returning = if ctx.gen_bool_with_prob(update_config.returning_probability) {
+            generate_update_returning(generator, ctx).ok()
+        } else {
+            None
+        };
 
         Ok(Stmt::Update(UpdateStmt {
             with_clause: with_clause.clone(),
             table: table.qualified_name(),
+            alias: target_alias.clone(),
             sets,
-            from,
+            from: from_clause.clone(),
+            joins: joins.clone(),
             where_clause,
             conflict,
+            returning,
         }))
     })
 }
@@ -450,6 +473,10 @@ pub fn generate_update<C: Capabilities>(
 /// probability controlled by `UpdateConfig::primary_key_update_probability`.
 /// Each assignment value may be an expression (with column refs enabled, so
 /// `SET x = x + 1` is valid) controlled by `UpdateConfig::expression_value_probability`.
+///
+/// When a FROM clause is active (multiple tables in scope), SET values may
+/// reference FROM-side columns (e.g. `SET x = src.y`), controlled by
+/// `UpdateConfig::from_set_reference_probability`.
 #[trace_gen(Origin::UpdateSet)]
 fn generate_update_sets<C: Capabilities>(
     generator: &SqlGen<C>,
@@ -459,9 +486,20 @@ fn generate_update_sets<C: Capabilities>(
     let pk_prob = update_config.primary_key_update_probability;
     let expr_prob = update_config.expression_value_probability;
     let expr_max_depth = update_config.expression_value_max_depth;
+    let from_ref_prob = update_config.from_set_reference_probability;
 
     // Read table columns from scope
     let table_columns = ctx.tables_in_scope()[0].table.columns.clone();
+
+    // Collect FROM-side tables for cross-table references
+    let from_tables: Vec<_> = if ctx.tables_in_scope().len() > 1 {
+        ctx.tables_in_scope()[1..]
+            .iter()
+            .map(|st| (st.qualifier.clone(), st.table.columns.clone()))
+            .collect()
+    } else {
+        vec![]
+    };
 
     // Build candidate columns: always include non-PK, include PK with probability
     let candidates: Vec<_> = table_columns
@@ -531,6 +569,15 @@ fn generate_update_sets<C: Capabilities>(
             continue;
         }
 
+        // When FROM is active, try referencing a FROM-side column
+        if !from_tables.is_empty() && ctx.gen_bool_with_prob(from_ref_prob) {
+            if let Some(expr) = generate_from_column_ref(ctx, col, &from_tables, generator.policy())
+            {
+                sets.push((col.name.clone(), expr));
+                continue;
+            }
+        }
+
         if let Some(ref expr_gen) = update_expr_gen {
             if ctx.gen_bool_with_prob(expr_prob) {
                 if let Ok(expr) = generate_expr(expr_gen, ctx, 0) {
@@ -544,6 +591,51 @@ fn generate_update_sets<C: Capabilities>(
     }
 
     Ok(sets)
+}
+
+/// Generate a column reference from a FROM-side table for use in a SET clause.
+///
+/// Tries to find a type-compatible column from one of the FROM tables. Falls back
+/// to any column if no exact type match exists. Returns None if no columns available.
+fn generate_from_column_ref(
+    ctx: &mut Context,
+    target_col: &crate::schema::ColumnDef,
+    from_tables: &[(String, Vec<crate::schema::ColumnDef>)],
+    policy: &crate::policy::Policy,
+) -> Option<Expr> {
+    // Pick a random FROM table
+    let (qualifier, columns) = ctx.choose(from_tables)?;
+    if columns.is_empty() {
+        return None;
+    }
+
+    // Try to find a type-compatible column
+    let compatible: Vec<_> = columns
+        .iter()
+        .filter(|c| c.data_type == target_col.data_type && !c.data_type.is_array())
+        .collect();
+    let non_array: Vec<_> = columns.iter().filter(|c| !c.data_type.is_array()).collect();
+    let source_col = if compatible.is_empty() {
+        // Fall back to any non-array column
+        ctx.choose(&non_array)?
+    } else {
+        ctx.choose(&compatible)?
+    };
+
+    // 50% bare ref, 50% expression wrapping the ref (e.g. src.col + 1)
+    let col_ref = Expr::column_ref(ctx, Some(qualifier.clone()), source_col.name.clone());
+    if ctx.gen_bool_with_prob(0.5) {
+        Some(col_ref)
+    } else {
+        let lit = generate_literal(ctx, source_col.data_type, policy);
+        let lit_expr = Expr::literal(ctx, lit);
+        let op = if source_col.data_type == DataType::Text {
+            BinOp::Concat
+        } else {
+            *ctx.choose(&[BinOp::Add, BinOp::Sub, BinOp::Mul]).unwrap()
+        };
+        Some(Expr::binary_op(ctx, col_ref, op, lit_expr))
+    }
 }
 
 /// Generate an optional conflict clause (OR ABORT/FAIL/IGNORE/REPLACE/ROLLBACK).
@@ -1244,36 +1336,76 @@ fn generate_insert_returning<C: Capabilities>(
 
 // ---- UPDATE features ----
 
+/// Generate the FROM clause for an UPDATE ... FROM statement.
+///
+/// Supports self-join (target table with mandatory alias), other tables, and
+/// optional JOINs after the FROM table. Returns the FromClause, any JoinClauses,
+/// and the list of tables to push into scope.
 #[trace_gen(Origin::UpdateFrom)]
 fn generate_update_from<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
     target_table: &crate::schema::Table,
-) -> Result<Option<crate::ast::FromClause>, GenError> {
-    let candidates: Vec<_> = generator
-        .schema()
-        .tables
-        .iter()
-        .filter(|table| table.qualified_name() != target_table.qualified_name())
-        .cloned()
-        .collect();
+) -> Result<Option<UpdateFromResult>, GenError> {
+    let update_config = &generator.policy().update_config;
+    let schema_tables = &generator.schema().tables;
 
-    let Some(from_table) = ctx.choose(&candidates).cloned() else {
-        return Ok(None);
+    // Decide: self-join (FROM target AS alias) or a different table
+    let is_self_join = ctx.gen_bool_with_prob(update_config.self_join_probability);
+
+    let from_table = if is_self_join {
+        target_table.clone()
+    } else {
+        let candidates: Vec<_> = schema_tables
+            .iter()
+            .filter(|t| t.qualified_name() != target_table.qualified_name())
+            .cloned()
+            .collect();
+        match ctx.choose(&candidates).cloned() {
+            Some(t) => t,
+            None => return Ok(None),
+        }
     };
 
-    let alias = if generator.policy().identifier_config.generate_table_aliases
-        && ctx.gen_bool_with_prob(generator.policy().select_config.table_alias_probability)
-    {
+    // Self-joins and same-name tables require an alias to avoid ambiguity
+    let needs_alias = is_self_join
+        || from_table.name == target_table.name
+        || (generator.policy().identifier_config.generate_table_aliases
+            && ctx.gen_bool_with_prob(generator.policy().select_config.table_alias_probability));
+    let alias = if needs_alias {
         Some(ctx.next_table_alias())
     } else {
         None
     };
 
-    Ok(Some(crate::ast::FromClause {
+    let from_clause = crate::ast::FromClause {
         table: from_table.qualified_name(),
-        alias,
+        alias: alias.clone(),
+    };
+
+    // Optionally generate JOINs after the FROM table
+    let joins = if ctx.gen_bool_with_prob(update_config.join_in_from_probability) {
+        // Push the FROM table into scope so generate_join_clauses can see it as [0]
+        let from_scope = vec![(from_table.clone(), alias.clone())];
+        ctx.with_table_scope(from_scope, |ctx| {
+            super::select::generate_join_clauses(generator, ctx)
+        })?
+    } else {
+        vec![]
+    };
+
+    Ok(Some(UpdateFromResult {
+        from_clause,
+        from_table,
+        joins,
     }))
+}
+
+/// Result of generating an UPDATE ... FROM clause.
+struct UpdateFromResult {
+    from_clause: crate::ast::FromClause,
+    from_table: crate::schema::Table,
+    joins: Vec<crate::ast::JoinClause>,
 }
 
 fn generate_update_from_where_clause<C: Capabilities>(
@@ -1326,12 +1458,27 @@ fn generate_update_from_where_clause<C: Capabilities>(
     })
 }
 
+/// Generate a RETURNING clause for an UPDATE statement.
+///
+/// Produces 1-3 column references from the target table (scope position 0).
 #[trace_gen(Origin::UpdateReturning)]
 fn generate_update_returning<C: Capabilities>(
     _generator: &SqlGen<C>,
-    _ctx: &mut Context,
+    ctx: &mut Context,
 ) -> Result<Vec<Expr>, GenError> {
-    todo!("UPDATE ... RETURNING generation")
+    let columns = ctx.tables_in_scope()[0].table.columns.clone();
+
+    if columns.is_empty() {
+        return Err(GenError::schema_empty("returning columns"));
+    }
+
+    let num_cols = ctx.gen_range_inclusive(1, columns.len().min(3));
+    let mut exprs = Vec::with_capacity(num_cols);
+    for _ in 0..num_cols {
+        let col = ctx.choose(&columns).unwrap();
+        exprs.push(Expr::column_ref(ctx, None, col.name.clone()));
+    }
+    Ok(exprs)
 }
 
 // ---- DELETE features ----
@@ -1812,9 +1959,10 @@ mod tests {
     }
 
     #[test]
-    fn test_update_with_from_one_table_falls_back_to_plain_update() {
+    fn test_update_with_from_one_table_can_self_join() {
         let policy = Policy::default().with_update_config(crate::policy::UpdateConfig {
             from_probability: 1.0,
+            self_join_probability: 1.0,
             ..Default::default()
         });
         let schema = SchemaBuilder::new()
@@ -1828,17 +1976,26 @@ mod tests {
             .build();
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
 
-        for seed in 0..20 {
+        let mut found_self_join = false;
+        for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
             let stmt = generate_update(&generator, &mut ctx)
                 .expect("single-table schemas should still generate UPDATE");
-            match stmt {
-                Stmt::Update(update) => {
-                    assert!(update.from.is_none());
+            if let Stmt::Update(update) = stmt {
+                if update.from.is_some() {
+                    // Self-join: FROM same table with alias
+                    assert!(
+                        update.from.as_ref().unwrap().alias.is_some(),
+                        "Self-join FROM must have an alias"
+                    );
+                    found_self_join = true;
                 }
-                other => panic!("expected UPDATE statement, got {other:?}"),
             }
         }
+        assert!(
+            found_self_join,
+            "Should generate UPDATE FROM with self-join on single-table schema"
+        );
     }
 
     #[test]

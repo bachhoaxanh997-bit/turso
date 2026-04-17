@@ -1445,6 +1445,21 @@ pub struct UpdateConfig {
 
     /// Probability of RETURNING clause.
     pub returning_probability: f64,
+
+    /// Probability of self-join (target table in FROM with alias).
+    pub self_join_probability: f64,
+
+    /// Probability of adding JOINs after the FROM table.
+    pub join_in_from_probability: f64,
+
+    /// Probability of using a subquery in FROM instead of a bare table.
+    pub subquery_from_probability: f64,
+
+    /// Probability of aliasing the target table (UPDATE t AS x).
+    pub target_alias_probability: f64,
+
+    /// Probability that a SET clause references a FROM-side column.
+    pub from_set_reference_probability: f64,
 }
 
 impl Default for UpdateConfig {
@@ -1461,6 +1476,11 @@ impl Default for UpdateConfig {
             cte_probability: 0.1,
             from_probability: 0.15,
             returning_probability: 0.0,
+            self_join_probability: 0.0,
+            join_in_from_probability: 0.0,
+            subquery_from_probability: 0.0,
+            target_alias_probability: 0.0,
+            from_set_reference_probability: 0.0,
         }
     }
 }
