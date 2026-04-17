@@ -1179,6 +1179,14 @@ expect {
     2
     3
 }
+expect @js {
+    1|11|xx|1.1
+    2|20|y|2
+    3|33|zz|3.3
+    1
+    2
+    3
+}
 
 # Expression index on (a+b) must stay correct when only 'a' is updated.
 @cross-check-integrity
