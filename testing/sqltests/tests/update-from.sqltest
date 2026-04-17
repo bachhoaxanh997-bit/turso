@@ -994,3 +994,421 @@ test update-from-or-replace-cascades-foreign-key-deletes {
 expect {
     1|b|10
 }
+
+# ─── Adversarial: ephemeral materialization / snapshot semantics ───
+
+# Shift every row's value to its predecessor's value. Without snapshot
+# semantics (ephemeral materialization), row 2 would see the already-updated
+# row 1 value instead of the original.
+@cross-check-integrity
+test update-from-snapshot-shift-predecessor {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+    UPDATE t SET v = prev.v
+      FROM t AS prev
+     WHERE t.id = prev.id + 1;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|3
+    5|4
+}
+
+# Mirror of the above — shift to successor values.
+@cross-check-integrity
+test update-from-snapshot-shift-successor {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+    UPDATE t SET v = nxt.v
+      FROM t AS nxt
+     WHERE t.id + 1 = nxt.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+    5|5
+}
+
+# Reverse the ordering of values via self-join. This swaps rows 1↔3
+# simultaneously — without snapshot semantics row 3 would see row 1's
+# already-updated value.
+@cross-check-integrity
+test update-from-snapshot-reverse-three-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+    UPDATE t AS a SET v = b.v
+      FROM t AS b
+     WHERE a.id = 4 - b.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|300
+    2|200
+    3|100
+}
+
+# Set every row to the pre-update sum. The subquery must read the
+# pre-materialization snapshot, not partially-updated rows.
+@cross-check-integrity
+test update-from-snapshot-set-to-pre-update-aggregate {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    UPDATE t SET v = (SELECT sum(v) FROM t) FROM (SELECT 1) AS dummy;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|60
+    2|60
+    3|60
+}
+
+# ─── Adversarial: type preservation through ephemeral table ───
+
+# Mixed storage classes must survive the round-trip through the BLOB-affinity
+# ephemeral scratch table without coercion.
+@cross-check-integrity
+test update-from-type-preservation-mixed-types {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    CREATE TABLE s(id INTEGER, v);
+    INSERT INTO t VALUES(1,NULL),(2,'hello'),(3,42),(4,3.14),(5,X'DEADBEEF');
+    INSERT INTO s VALUES(1,'replaced'),(2,NULL),(3,X'CAFE'),(4,999),(5,0.5);
+    UPDATE t SET v=s.v FROM s WHERE t.id=s.id;
+    SELECT id, typeof(v), quote(v) FROM t ORDER BY id;
+}
+expect {
+    1|text|'replaced'
+    2|null|NULL
+    3|blob|X'CAFE'
+    4|integer|999
+    5|real|0.5
+}
+
+# Integer affinity column receiving a text value that looks like a number.
+# The ephemeral table uses BLOB affinity, so the coercion must happen
+# during the final INSERT, not during materialization.
+@cross-check-integrity
+test update-from-affinity-coercion-at-insert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v TEXT);
+    INSERT INTO t VALUES(1,10);
+    INSERT INTO s VALUES(1,'99');
+    UPDATE t SET v=s.v FROM s WHERE t.id=s.id;
+    SELECT typeof(v), v FROM t;
+}
+expect {
+    integer|99
+}
+
+# i64 extremes must survive the ephemeral round-trip.
+@cross-check-integrity
+test update-from-i64-extremes-through-ephemeral {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,9223372036854775807),(2,-9223372036854775808);
+    UPDATE t SET v=s.v FROM s WHERE t.id=s.id;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|9223372036854775807
+    2|-9223372036854775808
+}
+
+# ─── Adversarial: self-join cursor confusion ───
+
+# Triple self-join: the same physical table is opened three times. Cursor
+# management must keep the write cursor, the two read aliases, and the
+# ephemeral scratch table separate.
+@cross-check-integrity
+test update-from-triple-self-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    UPDATE t AS x SET v = y.v + z.v
+      FROM t AS y, t AS z
+     WHERE x.id = y.id AND x.id = z.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    2|40
+}
+
+# Linked-list traversal via self-join. Each node gets its parent's value.
+@cross-check-integrity
+test update-from-self-join-linked-list {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, next_id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,2,10),(2,3,20),(3,NULL,30);
+    UPDATE t SET v = nxt.v FROM t AS nxt WHERE t.next_id = nxt.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2|20
+    2|3|30
+    3||30
+}
+
+# ─── Adversarial: index consistency after FROM-driven mutations ───
+
+# Three separate indexes all updated in one UPDATE FROM statement.
+@cross-check-integrity
+test update-from-three-indexes-maintained {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL);
+    CREATE INDEX t_a ON t(a);
+    CREATE INDEX t_b ON t(b);
+    CREATE INDEX t_c ON t(c);
+    CREATE TABLE s(id INTEGER, na INTEGER, nb TEXT, nc REAL);
+    INSERT INTO t VALUES(1,10,'x',1.0),(2,20,'y',2.0),(3,30,'z',3.0);
+    INSERT INTO s VALUES(1,11,'xx',1.1),(3,33,'zz',3.3);
+    UPDATE t SET a=s.na, b=s.nb, c=s.nc FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+    SELECT id FROM t WHERE a=11;
+    SELECT id FROM t WHERE b='y';
+    SELECT id FROM t WHERE c=3.3;
+}
+expect {
+    1|11|xx|1.1
+    2|20|y|2.0
+    3|33|zz|3.3
+    1
+    2
+    3
+}
+
+# Expression index on (a+b) must stay correct when only 'a' is updated.
+@cross-check-integrity
+test update-from-expression-index-partial-column-update {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE INDEX t_expr ON t(a + b);
+    CREATE TABLE s(id INTEGER, new_a INTEGER);
+    INSERT INTO t VALUES(1,10,5),(2,20,10);
+    INSERT INTO s VALUES(1,100);
+    UPDATE t SET a=s.new_a FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+    SELECT id FROM t WHERE a + b = 105;
+    SELECT id FROM t WHERE a + b = 30;
+}
+expect {
+    1|100|5
+    2|20|10
+    1
+    2
+}
+
+# ─── Adversarial: OR REPLACE cascading through ephemeral plan ───
+
+# All four rows chain-conflict: row 1→gets key of row 2 (deleting 2),
+# row 2→gets key of row 3 (but row 2 is already gone), etc.
+# The ephemeral snapshot means the conflict set is computed before any
+# deletes happen.
+@cross-check-integrity
+test update-from-or-replace-cascading-unique-chain {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE);
+    CREATE TABLE s(id INTEGER, new_k INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40);
+    INSERT INTO s VALUES(1,20),(2,30),(3,40),(4,50);
+    UPDATE OR REPLACE t SET k=s.new_k FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    3|40
+}
+
+# OR REPLACE that swaps unique keys between two rows simultaneously.
+# Without snapshot semantics, the second row's update would fail because
+# the first row already holds the conflicting key.
+@cross-check-integrity
+test update-from-or-replace-swap-unique-keys {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE, v TEXT);
+    CREATE TABLE s(id INTEGER, new_k INTEGER, new_v TEXT);
+    INSERT INTO t VALUES(1,10,'a'),(2,20,'b'),(3,30,'c');
+    INSERT INTO s VALUES(1,20,'aa'),(3,10,'cc');
+    UPDATE OR REPLACE t SET k=s.new_k, v=s.new_v FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20|aa
+    3|10|cc
+}
+
+# ─── Adversarial: OR IGNORE with NOT NULL and CHECK ───
+
+# OR IGNORE + NOT NULL: source provides NULL for some rows. Those rows
+# should be skipped while the rest update normally.
+@cross-check-integrity
+test update-from-or-ignore-skips-notnull-violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,NULL),(2,100),(3,NULL);
+    UPDATE OR IGNORE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|100
+    3|30
+}
+
+# OR IGNORE + CHECK: only the row violating the CHECK is skipped.
+@cross-check-integrity
+test update-from-or-ignore-skips-check-violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER CHECK(v > 0));
+    CREATE TABLE s(id INTEGER, new_v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,100),(2,-5),(3,300);
+    UPDATE OR IGNORE t SET v = s.new_v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|20
+    3|300
+}
+
+# ─── Adversarial: BEFORE trigger modifies the row being updated ───
+
+# The BEFORE trigger bumps a non-SET column. After the trigger fires the
+# row is re-read; the SET value from the FROM source must still apply, and
+# the trigger's change to the non-SET column must be visible in the result.
+@cross-check-integrity
+test update-from-before-trigger-modifies-target-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, extra INTEGER);
+    CREATE TABLE s(id INTEGER, new_v INTEGER);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN
+      UPDATE t SET extra = extra + 1000 WHERE id = NEW.id;
+    END;
+    INSERT INTO t VALUES(1,10,0),(2,20,0);
+    INSERT INTO s VALUES(1,100),(2,200);
+    UPDATE t SET v = s.new_v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100|1000
+    2|200|1000
+}
+
+# ─── Adversarial: cartesian product and duplicate source rows ───
+
+# Cartesian product: FROM source has multiple rows but no join condition
+# to the target. Each target row should be updated exactly once (not N
+# times for N source rows).
+@cross-check-integrity
+test update-from-cartesian-updates-once {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(x INTEGER);
+    INSERT INTO t VALUES(1,0);
+    INSERT INTO s VALUES(1),(2),(3);
+    UPDATE t SET v = 999 FROM s;
+    SELECT * FROM t;
+}
+expect {
+    1|999
+}
+
+# No-PK table with duplicate target rows matching the same source row.
+# Both target rows should be updated.
+@cross-check-integrity
+test update-from-no-pk-duplicate-target-rows {
+    CREATE TABLE t(a, b, c);
+    CREATE TABLE s(a, x);
+    INSERT INTO t VALUES(1,2,3),(1,5,6);
+    INSERT INTO s VALUES(1,99);
+    UPDATE t SET b=s.x FROM s WHERE t.a=s.a;
+    SELECT * FROM t ORDER BY c;
+}
+expect {
+    1|99|3
+    1|99|6
+}
+
+# ─── Adversarial: correlated subquery in SET referencing FROM source ───
+
+# The subquery in SET references the FROM-side table. This exercises the
+# subquery re-phasing logic that moves SET subqueries into the ephemeral
+# plan for UPDATE FROM.
+@cross-check-integrity
+test update-from-correlated-subquery-refs-from-source {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, category INTEGER);
+    CREATE TABLE lookup(category INTEGER, bonus INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO lookup VALUES(10,5),(20,8);
+    UPDATE t SET v = (SELECT bonus FROM lookup WHERE lookup.category = s.category)
+      FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|5
+    2|8
+}
+
+# ─── Adversarial: window function in FROM subquery ───
+
+@cross-check-integrity
+test update-from-window-function-in-from-subquery {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, rank INTEGER);
+    INSERT INTO t VALUES(1,3),(2,1),(3,2);
+    UPDATE t SET rank = sub.new_rank
+      FROM (
+        SELECT id, row_number() OVER (ORDER BY rank) AS new_rank FROM t
+      ) AS sub
+     WHERE t.id = sub.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|3
+    2|1
+    3|2
+}
+
+# ─── Adversarial: rowid mutation via FROM ───
+
+# Changing the INTEGER PRIMARY KEY (rowid alias) via a FROM source.
+@cross-check-integrity
+test update-from-rowid-mutation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old_id INTEGER, new_id INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,100);
+    UPDATE t SET id = s.new_id FROM s WHERE t.id = s.old_id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|20
+    3|30
+    100|10
+}
+
+# Rowid mutation that conflicts with an existing row should ABORT.
+test update-from-rowid-mutation-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old_id INTEGER, new_id INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,2);
+    UPDATE t SET id = s.new_id FROM s WHERE t.id = s.old_id;
+}
+expect error {
+}
+
+# OR REPLACE on a rowid collision via FROM should delete the conflicting row.
+@cross-check-integrity
+test update-from-or-replace-rowid-collision {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old_id INTEGER, new_id INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,2);
+    UPDATE OR REPLACE t SET id = s.new_id FROM s WHERE t.id = s.old_id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|10
+    3|30
+}
