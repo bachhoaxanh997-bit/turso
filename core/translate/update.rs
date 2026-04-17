@@ -449,13 +449,13 @@ pub fn prepare_update_plan(
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
-    let updated_cols = (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
-    let affected_cols = updated_cols.as_ref().map(|updated_cols: &ColumnMask| {
-        match table.btree() {
-            Some(bt) => bt.columns_affected_by_update(updated_cols),
-            None => updated_cols.clone(),
-        }
-    });
+    let updated_cols: Option<ColumnMask> =
+        (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
+    let affected_cols = match (table.btree(), updated_cols.as_ref()) {
+        (Some(bt), Some(updated)) => Some(bt.columns_affected_by_update(updated)?),
+        (None, Some(updated)) => Some(updated.clone()),
+        _ => None,
+    };
     let mut indexes_to_update = Vec::new();
 
     for idx in indexes {
