@@ -107,13 +107,13 @@ pub fn translate_update(
 /// expanded their true width. UPDATE does the same here: once the RHS has been
 /// planned, multi-column subqueries become a single `SubqueryResult { RowValue }`
 /// and can be projected into scalar field reads without cloning the subquery.
-fn split_update_set_values(expr: &Expr, target_count: usize) -> crate::Result<Vec<Box<Expr>>> {
+fn split_update_set_values(expr: &Expr, target_count: usize) -> crate::Result<Vec<Expr>> {
     match expr {
         Expr::Parenthesized(vals) => {
             if vals.len() != target_count {
                 bail_parse_error!("{} columns assigned {} values", target_count, vals.len());
             }
-            Ok(vals.clone())
+            Ok(vals.iter().map(|expr| (**expr).clone()).collect())
         }
         Expr::SubqueryResult {
             subquery_id,
@@ -129,16 +129,14 @@ fn split_update_set_values(expr: &Expr, target_count: usize) -> crate::Result<Ve
                 bail_parse_error!("{} columns assigned {} values", target_count, num_regs);
             }
             Ok((0..*num_regs)
-                .map(|offset| {
-                    Box::new(Expr::SubqueryResult {
-                        subquery_id: *subquery_id,
-                        lhs: lhs.clone(),
-                        not_in: *not_in,
-                        query_type: ast::SubqueryType::RowValue {
-                            result_reg_start: result_reg_start + offset,
-                            num_regs: 1,
-                        },
-                    })
+                .map(|offset| Expr::SubqueryResult {
+                    subquery_id: *subquery_id,
+                    lhs: lhs.clone(),
+                    not_in: *not_in,
+                    query_type: ast::SubqueryType::RowValue {
+                        result_reg_start: result_reg_start + offset,
+                        num_regs: 1,
+                    },
                 })
                 .collect())
         }
@@ -149,7 +147,7 @@ fn split_update_set_values(expr: &Expr, target_count: usize) -> crate::Result<Ve
             if target_count != 1 {
                 bail_parse_error!("{} columns assigned 1 values", target_count);
             }
-            Ok(vec![expr.clone().into()])
+            Ok(vec![expr.clone()])
         }
     }
 }
@@ -379,7 +377,8 @@ pub fn prepare_update_plan(
     for set in &mut body.sets {
         let values = split_update_set_values(set.expr.as_ref(), set.col_names.len())?;
 
-        for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
+        for (col_name, expr) in set.col_names.iter().zip(values.into_iter()) {
+            let expr = Box::new(expr);
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
@@ -400,14 +399,14 @@ pub fn prepare_update_plan(
                         {
                             // Use the rowid alias column index
                             match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
-                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
+                                Some((_, existing_expr)) => existing_expr.clone_from(&expr),
                                 None => set_clauses.push((idx, expr.clone())),
                             }
                             idx
                         } else {
                             // No rowid alias, use sentinel value for actual rowid
                             match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
-                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
+                                Some((_, existing_expr)) => existing_expr.clone_from(&expr),
                                 None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
                             }
                             ROWID_SENTINEL
@@ -446,10 +445,10 @@ pub fn prepare_update_plan(
                                 },
                             });
                         } else {
-                            existing_expr.clone_from(expr);
+                            existing_expr.clone_from(&expr);
                         }
                     } else {
-                        existing_expr.clone_from(expr);
+                        existing_expr.clone_from(&expr);
                     }
                 }
                 None => set_clauses.push((col_index, expr.clone())),

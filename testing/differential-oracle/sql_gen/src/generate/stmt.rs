@@ -1386,7 +1386,7 @@ fn generate_update_from<C: Capabilities>(
     // Optionally generate JOINs after the FROM table
     let joins = if ctx.gen_bool_with_prob(update_config.join_in_from_probability) {
         // Push the FROM table into scope so generate_join_clauses can see it as [0]
-        let from_scope = vec![(from_table.clone(), alias.clone())];
+        let from_scope = vec![(from_table.clone(), alias)];
         ctx.with_table_scope(from_scope, |ctx| {
             super::select::generate_join_clauses(generator, ctx)
         })?
