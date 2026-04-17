@@ -61,7 +61,7 @@ use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
@@ -932,13 +932,32 @@ fn first_update_safety_reason(
     Ok(reason)
 }
 
+#[derive(Default)]
+struct SubqueryIdSet(BitSet);
+
+impl SubqueryIdSet {
+    fn insert(&mut self, id: turso_parser::ast::TableInternalId) {
+        self.0.set(usize::from(id));
+    }
+
+    fn contains(&self, id: turso_parser::ast::TableInternalId) -> bool {
+        self.0.get(usize::from(id))
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for id in other.0.iter() {
+            self.0.set(id);
+        }
+    }
+}
+
 fn collect_subquery_result_ids_from_returning(
     returning: Option<&[ResultSetColumn]>,
-) -> Result<HashSet<turso_parser::ast::TableInternalId>> {
+) -> Result<SubqueryIdSet> {
     use crate::translate::expr::walk_expr;
     use crate::translate::expr::WalkControl;
 
-    let mut ids = HashSet::default();
+    let mut ids = SubqueryIdSet::default();
     let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
             ids.insert(*subquery_id);
@@ -956,13 +975,11 @@ fn collect_subquery_result_ids_from_returning(
 /// Collect SubqueryResult IDs referenced in SET clause and RETURNING expressions.
 /// These subqueries must stay in the main update plan (evaluated during the update phase),
 /// not be moved to the ephemeral plan (which only collects rowids).
-fn collect_update_phase_subquery_ids(
-    plan: &UpdatePlan,
-) -> Result<HashSet<turso_parser::ast::TableInternalId>> {
+fn collect_update_phase_subquery_ids(plan: &UpdatePlan) -> Result<SubqueryIdSet> {
     use crate::translate::expr::walk_expr;
     use crate::translate::expr::WalkControl;
 
-    let mut ids = HashSet::default();
+    let mut ids = SubqueryIdSet::default();
     let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
             ids.insert(*subquery_id);
@@ -972,7 +989,7 @@ fn collect_update_phase_subquery_ids(
     for (_, expr) in plan.set_clauses.iter() {
         walk_expr(expr, &mut collector)?;
     }
-    ids.extend(collect_subquery_result_ids_from_returning(
+    ids.union_with(&collect_subquery_result_ids_from_returning(
         plan.returning.as_deref(),
     )?);
     Ok(ids)
@@ -1145,7 +1162,7 @@ fn add_ephemeral_table_to_update_plan(
             let mut ephemeral_subs = Vec::new();
             let mut remaining = Vec::new();
             for sq in plan.non_from_clause_subqueries.drain(..) {
-                if ids_to_keep_in_main_plan.contains(&sq.internal_id) {
+                if ids_to_keep_in_main_plan.contains(sq.internal_id) {
                     remaining.push(sq);
                 } else {
                     let mut sq = sq;
