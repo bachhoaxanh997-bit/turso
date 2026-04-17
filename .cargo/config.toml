@@ -5,7 +5,7 @@ LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS" # necessary for rusqlite dep
 # turso-sync package uses tokio_unstable to seed LocalRuntime and make it deterministic
 # unfortunately, cargo commands invoked from workspace root didn't capture config.toml from dependent crate
 # so, we set this cfg globally for workspace (see relevant issue build build-target: https://github.com/rust-lang/cargo/issues/7004)
-rustflags = [
+
     "--cfg=tokio_unstable",
 ]
 
